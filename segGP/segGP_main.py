@@ -6,7 +6,7 @@ import gp_restrict as gp_restrict
 import algo_iegp as evalGP
 import numpy as np
 from deap import base, creator, tools, gp
-import felgp_functions as felgp_fs
+import BookCode.segGP.seggp_functions as felgp_fs
 from typing import Any
 from strongGPDataType import Int1, Int2, Int3, Int4, Int5, Int6
 from strongGPDataType import Float1, Float2, Float3
