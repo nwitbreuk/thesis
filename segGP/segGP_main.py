@@ -28,10 +28,10 @@ y_train = np.load(dataSetName+'_train_label.npy')
 x_test = np.load(dataSetName+'_test_data.npy')/255.0
 y_test = np.load(dataSetName+'_test_label.npy')
 
-# Restrict training and testing set size
+# Restrict training and testing set sizes
 x_train = x_train[:50]
 y_train = y_train[:50]
-x_test = x_test[:20]    
+x_test = x_test[:20]
 y_test = y_test[:20]
 
 print(x_train.shape,y_train.shape, x_test.shape,y_test.shape)

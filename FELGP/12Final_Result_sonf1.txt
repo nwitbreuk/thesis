@@ -1,0 +1,10 @@
+randomSeed
+12
+trainTime
+19978.947483889
+trainResults
+(np.float64(100.0),)
+testResults
+98.0
+bestInd in training
+Combine3(RF(FeaCon3(F_HOG(Image0), F_HOG(MaxP(Image0, 2, 2)), F_HOG(Image0)), Image1, 470, 60), RF(FeaCon4(F_HOG(W_Add(Image0, 0.092, Image0, 0.344)), F_HOG(SobelY(LoG2(Image0))), F_HOG(SobelY(Image0)), F_SIFT(Min(Image0))), Image1, 110, 90), SVM(FeaCon4(F_uLBP(Max(Image0)), F_uLBP(Sqrt(Image0)), F_HOG(LoG2(SobelY(Mean(Image0)))), F_SIFT(Med(Image0))), Image1, -2))
