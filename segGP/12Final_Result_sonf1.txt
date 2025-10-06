@@ -1,0 +1,10 @@
+randomSeed
+12
+trainTime
+2866.076785524
+trainResults
+(np.float64(98.0),)
+testResults
+80.0
+bestInd in training
+Combine3(LR(FeaCon2(F_HOG(Image0), F_HOG(Image0)), Image1, 1), SVM(FeaCon3(F_SIFT(Image0), F_HOG(Lap(Image0)), F_SIFT(Image0)), Image1, 3), RF(FeaCon4(F_HOG(Image0), F_HOG(Image0), F_SIFT(Image0), F_SIFT(Image0)), Image1, 500, 100))

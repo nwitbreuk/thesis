@@ -2,11 +2,12 @@
 import operator
 import random
 import time
+import multiprocessing
 import gp_restrict as gp_restrict
 import algo_iegp as evalGP
 import numpy as np
 from deap import base, creator, tools, gp
-import BookCode.segGP.seggp_functions as felgp_fs
+import seggp_functions as felgp_fs
 from typing import Any
 from strongGPDataType import Int1, Int2, Int3, Int4, Int5, Int6
 from strongGPDataType import Float1, Float2, Float3
@@ -28,17 +29,29 @@ y_train = np.load(dataSetName+'_train_label.npy')
 x_test = np.load(dataSetName+'_test_data.npy')/255.0
 y_test = np.load(dataSetName+'_test_label.npy')
 
-# Restrict training and testing set sizes
-x_train = x_train[:50]
-y_train = y_train[:50]
-x_test = x_test[:20]
-y_test = y_test[:20]
+def stratified_sample(x, y, n_samples):
+    """Randomly select n_samples, ensuring both classes are present."""
+    classes = np.unique(y)
+    idxs = []
+    # Ensure at least one sample from each class
+    for c in classes:
+        class_idxs = np.where(y == c)[0]
+        idxs.append(np.random.choice(class_idxs, 1, replace=False)[0])
+    # Fill the rest randomly
+    remaining = list(set(range(len(y))) - set(idxs))
+    if n_samples > len(idxs):
+        idxs += list(np.random.choice(remaining, n_samples - len(idxs), replace=False))
+    np.random.shuffle(idxs)
+    return x[idxs], y[idxs]
+
+x_train, y_train = stratified_sample(x_train, y_train, 50)
+x_test, y_test = stratified_sample(x_test, y_test, 20)
 
 print(x_train.shape,y_train.shape, x_test.shape,y_test.shape)
 print(x_train.max())
 #parameters:
 num_train = x_train.shape[0]
-pop_size=100
+pop_size=50
 generation=30
 cxProb=0.8
 mutProb=0.19
@@ -133,14 +146,31 @@ creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMax) # type: ignore
 
 toolbox = base.Toolbox()
+pool = multiprocessing.Pool()
 toolbox.register("expr", gp_restrict.genHalfAndHalfMD, pset=pset, min_=initialMinDepth, max_=initialMaxDepth)
 toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.expr) # type: ignore
 toolbox.register("population", tools.initRepeat, list, toolbox.individual) # type: ignore
 toolbox.register("compile", gp.compile, pset=pset)
-toolbox.register("mapp", map)
+toolbox.register("mapp", pool.map)
 
 
 def evalTrain(toolbox, individual, hof, trainData, trainLabel):
+    """
+    Evaluate the fitness of an individual on the training data.
+    If the individual is in the Hall of Fame, reuse its fitness.
+    Otherwise, compile and execute the individual, compute predictions,
+    and return classification accuracy as fitness.
+
+    Args:
+        toolbox: DEAP toolbox with compile method.
+        individual: The GP individual to evaluate.
+        hof: Hall of Fame list of individuals.
+        trainData: Training data (features).
+        trainLabel: Training labels.
+
+    Returns:
+        Tuple containing accuracy as a single-element tuple.
+    """
     if len(hof) != 0 and individual in hof:
         ind = 0
         while ind < len(hof):
@@ -170,6 +200,18 @@ toolbox.decorate("mate", gp.staticLimit(key=operator.attrgetter("height"), max_v
 toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"), max_value=maxDepth))
 
 def GPMain(randomSeeds):
+    """
+    Main Genetic Programming loop.
+    Initializes population, statistics, and runs the evolutionary algorithm.
+
+    Args:
+        randomSeeds: Seed for random number generator.
+
+    Returns:
+        pop: Final population.
+        log: Logbook with statistics.
+        hof: Hall of Fame individuals.
+    """
 
     random.seed(randomSeeds)
    
@@ -191,6 +233,22 @@ def GPMain(randomSeeds):
     return pop,log, hof
 
 def evalTest(toolbox, individual, trainData, trainLabel, test, testL):
+    """
+    Evaluate the best individual on the test set.
+    Concatenates train and test data, compiles and executes the individual,
+    and computes classification accuracy on the test set.
+
+    Args:
+        toolbox: DEAP toolbox with compile method.
+        individual: The GP individual to evaluate.
+        trainData: Training data (features).
+        trainLabel: Training labels.
+        test: Test data (features).
+        testL: Test labels.
+
+    Returns:
+        accuracy: Classification accuracy on the test set (percentage).
+    """
     x_train = np.concatenate((trainData, test), axis=0)
     func = toolbox.compile(expr=individual)
     output = np.asarray(func(x_train, trainLabel))
