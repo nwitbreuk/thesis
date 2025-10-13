@@ -1,17 +1,22 @@
 #python packages
 import operator
 import random
+import torch
+from torch.utils.data import random_split, DataLoader
+import os
+import torch.nn.functional as F
+import numpy as np
 import time
 import multiprocessing
+from weizmann_loader import WeizmannHorseDataset
 import gp_restrict as gp_restrict
 import algo_iegp as evalGP
 import numpy as np
 from deap import base, creator, tools, gp
 import seggp_functions as felgp_fs
 from typing import Any
-from strongGPDataType import Int1, Int2, Int3, Int4, Int5, Int6
-from strongGPDataType import Float1, Float2, Float3
-from strongGPDataType import Array1, Array2, Array3, Array4, Array5, Array6
+from visualize import visualize_predictions
+
 # defined by author
 import saveFile
 import sys
@@ -20,127 +25,118 @@ toolbox: base.Toolbox  # type: ignore
 creator.FitnessMax: Any  # type: ignore
 creator.Individual: Any  # type: ignore
 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 randomSeeds = 12
-dataSetName = 'f1'
 
+dataSetName = 'weizmann_horse'
+image_dir = "data/weizmann_horse/horse"
+mask_dir = "data/weizmann_horse/mask"
+dataset = WeizmannHorseDataset(image_dir, mask_dir)
 
-x_train = np.load(dataSetName+'_train_data.npy')/255.0
-y_train = np.load(dataSetName+'_train_label.npy')
-x_test = np.load(dataSetName+'_test_data.npy')/255.0
-y_test = np.load(dataSetName+'_test_label.npy')
+def pad_collate(batch):
+    """
+    Collate function to pad images and masks in a batch to the same size.
+        Args:
+    batch: List of tuples (image, mask).
+        Returns:
+    Padded images and masks as tensors.
+    """
+    # batch: List[Tuple[tensor(C,H,W), tensor(C,H,W)]]
+    imgs, masks = zip(*batch)
+    max_h = max(t.shape[1] for t in imgs)
+    max_w = max(t.shape[2] for t in imgs)
+    pad_imgs, pad_masks = [], []
+    for im, ms in zip(imgs, masks):
+        dh = max_h - im.shape[1]
+        dw = max_w - im.shape[2]
+        pad = (0, dw, 0, dh)  # (left, right, top, bottom)
+        pad_imgs.append(F.pad(im, pad, value=0.0))
+        pad_masks.append(F.pad(ms, pad, value=0.0))
+    return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
-def stratified_sample(x, y, n_samples):
-    """Randomly select n_samples, ensuring both classes are present."""
-    classes = np.unique(y)
-    idxs = []
-    # Ensure at least one sample from each class
-    for c in classes:
-        class_idxs = np.where(y == c)[0]
-        idxs.append(np.random.choice(class_idxs, 1, replace=False)[0])
-    # Fill the rest randomly
-    remaining = list(set(range(len(y))) - set(idxs))
-    if n_samples > len(idxs):
-        idxs += list(np.random.choice(remaining, n_samples - len(idxs), replace=False))
-    np.random.shuffle(idxs)
-    return x[idxs], y[idxs]
+FAST_MODE = False  # set False for full run
 
-x_train, y_train = stratified_sample(x_train, y_train, 50)
-x_test, y_test = stratified_sample(x_test, y_test, 20)
+# parameters (shrink for fast iteration)
+pop_size   = 10 if FAST_MODE else 50
+generation = 5  if FAST_MODE else 30
+cxProb     = 0.8
+mutProb    = 0.19
+elitismProb= 0.01
+initialMinDepth = 2
+initialMaxDepth = 6 if FAST_MODE else 8
+maxDepth        = 6 if FAST_MODE else 8
 
-print(x_train.shape,y_train.shape, x_test.shape,y_test.shape)
-print(x_train.max())
-#parameters:
-num_train = x_train.shape[0]
-pop_size=50
-generation=30
-cxProb=0.8
-mutProb=0.19
-elitismProb=0.01
-totalRuns = 1
-initialMinDepth=2
-initialMaxDepth=8
-maxDepth=8
+# Split and optionally cap train/test sizes
+full_train_size = int(0.8 * len(dataset))
+full_test_size  = len(dataset) - full_train_size
+train_dataset, test_dataset = random_split(
+    dataset, [full_train_size, full_test_size],
+    generator=torch.Generator().manual_seed(42)
+)
+
+if FAST_MODE:
+    # cap the number of samples used
+    from torch.utils.data import Subset
+    max_train = 80
+    max_test  = 32
+    train_idx = list(range(min(max_train, len(train_dataset))))
+    test_idx  = list(range(min(max_test, len(test_dataset))))
+    train_dataset = Subset(train_dataset, train_idx)
+    test_dataset  = Subset(test_dataset, test_idx)
+
+# DataLoaders: increase workers and pin memory for CUDA
+num_workers = min(4, os.cpu_count() or 1)
+pin = (device == 'cuda')
+train_loader = DataLoader(train_dataset, batch_size=8 if not FAST_MODE else 4,
+                          shuffle=True, collate_fn=pad_collate,
+                          num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
+test_loader  = DataLoader(test_dataset, batch_size=8 if not FAST_MODE else 4,
+                          shuffle=False, collate_fn=pad_collate,
+                          num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
 
 ##GP
-pset = gp.PrimitiveSetTyped('MAIN', [Array1, Array2], Array6, prefix = 'Image')
-# Combination, use 'Combine' for increasing the depth of the GP tree
-pset.addPrimitive(felgp_fs.combine, [Array6, Array6, Array6], Array6, name='Combine')
-pset.addPrimitive(felgp_fs.combine, [Array5, Array5, Array5], Array6, name='Combine3')
-pset.addPrimitive(felgp_fs.combine, [Array5, Array5, Array5, Array5, Array5], Array6, name='Combine5')
-pset.addPrimitive(felgp_fs.combine, [Array5, Array5, Array5, Array5, Array5, Array5, Array5], Array6, name='Combine7')
-#Classification
-pset.addPrimitive(felgp_fs.linear_svm, [Array4, Array2, Int4], Array5, name='SVM')
-pset.addPrimitive(felgp_fs.lr, [Array4, Array2, Int4], Array5, name='LR')
-pset.addPrimitive(felgp_fs.randomforest, [Array4, Array2, Int5, Int6], Array5, name='RF')
-pset.addPrimitive(felgp_fs.erandomforest, [Array4, Array2, Int5, Int6], Array5, name='ERF')
-###Feature Concatenation
-pset.addPrimitive(felgp_fs.FeaCon2, [Array4, Array4], Array4, name ='FeaCon')
-pset.addPrimitive(felgp_fs.FeaCon2, [Array3, Array3], Array4, name ='FeaCon2')
-pset.addPrimitive(felgp_fs.FeaCon3, [Array3, Array3, Array3], Array4, name ='FeaCon3')
-pset.addPrimitive(felgp_fs.FeaCon4, [Array3, Array3, Array3, Array3], Array4, name ='FeaCon4')
+pset = gp.PrimitiveSetTyped('MAIN', [torch.Tensor], torch.Tensor, prefix='Image')
+
+# Add arithmetic
+pset.addPrimitive(felgp_fs.add, [torch.Tensor, torch.Tensor], torch.Tensor, name="Add")
+pset.addPrimitive(felgp_fs.sub, [torch.Tensor, torch.Tensor], torch.Tensor, name="Sub")
+pset.addPrimitive(felgp_fs.mul, [torch.Tensor, torch.Tensor], torch.Tensor, name="Mul")
+pset.addPrimitive(felgp_fs.safe_div, [torch.Tensor, torch.Tensor], torch.Tensor, name="SafeDiv")
+
+# Add comparison and normalization
+pset.addPrimitive(felgp_fs.gt, [torch.Tensor, float], torch.Tensor, name="Gt")
+pset.addPrimitive(felgp_fs.lt, [torch.Tensor, float], torch.Tensor, name="Lt")
+pset.addPrimitive(felgp_fs.normalize, [torch.Tensor], torch.Tensor, name="Normalize")
+
 #Feature Extraction
-pset.addPrimitive(felgp_fs.global_hog_small, [Array1], Array3, name = 'F_HOG')
-pset.addPrimitive(felgp_fs.all_lbp, [Array1], Array3, name = 'F_uLBP')
-pset.addPrimitive(felgp_fs.all_sift, [Array1], Array3, name = 'F_SIFT')
-##Filtering and Pooling
-pset.addPrimitive(felgp_fs.maxP, [Array1, Int3, Int3], Array1,name='MaxP')
-pset.addPrimitive(felgp_fs.gau, [Array1, Int1], Array1, name='Gau')
-pset.addPrimitive(felgp_fs.gauD, [Array1, Int1, Int2, Int2], Array1, name='GauD')
-pset.addPrimitive(felgp_fs.gab, [Array1, Float1, Float2], Array1, name='Gabor')
-pset.addPrimitive(felgp_fs.laplace, [Array1], Array1, name='Lap')
-pset.addPrimitive(felgp_fs.gaussian_Laplace1, [Array1], Array1, name='LoG1')
-pset.addPrimitive(felgp_fs.gaussian_Laplace2, [Array1], Array1, name='LoG2')
-pset.addPrimitive(felgp_fs.sobelxy, [Array1], Array1, name='Sobel')
-pset.addPrimitive(felgp_fs.sobelx, [Array1], Array1, name='SobelX')
-pset.addPrimitive(felgp_fs.sobely, [Array1], Array1, name='SobelY')
-pset.addPrimitive(felgp_fs.lbp, [Array1], Array1, name='LBP')
-pset.addPrimitive(felgp_fs.hog_feature, [Array1], Array1, name='HoG')
-pset.addPrimitive(felgp_fs.medianf, [Array1], Array1,name='Med')
-pset.addPrimitive(felgp_fs.maxf, [Array1], Array1,name='Max')
-pset.addPrimitive(felgp_fs.minf, [Array1], Array1,name='Min')
-pset.addPrimitive(felgp_fs.meanf, [Array1], Array1,name='Mean')
-pset.addPrimitive(felgp_fs.sqrt, [Array1], Array1, name='Sqrt')
-pset.addPrimitive(felgp_fs.mixconadd, [Array1, Float3, Array1, Float3], Array1, name='W_Add')
-pset.addPrimitive(felgp_fs.mixconsub, [Array1, Float3, Array1, Float3], Array1, name='W_Sub')
-pset.addPrimitive(felgp_fs.relu, [Array1], Array1, name='Relu')
+#pset.addPrimitive(felgp_fs.global_hog_small, [Array1], Array3, name = 'F_HOG')
+#pset.addPrimitive(felgp_fs.all_lbp, [Array1], Array3, name = 'F_uLBP')
+#pset.addPrimitive(felgp_fs.all_sift, [Array1], Array3, name = 'F_SIFT')
+
+# Add filters and logicals
+pset.addPrimitive(felgp_fs.sobel_x, [torch.Tensor], torch.Tensor, name="SobelX")
+pset.addPrimitive(felgp_fs.sobel_y, [torch.Tensor], torch.Tensor, name="SobelY")
+pset.addPrimitive(felgp_fs.laplacian, [torch.Tensor], torch.Tensor, name="Laplacian")
+pset.addPrimitive(felgp_fs.gradient_magnitude, [torch.Tensor], torch.Tensor, name="GradientMagnitude")
+pset.addPrimitive(felgp_fs.erode, [torch.Tensor], torch.Tensor, name="Erode")
+pset.addPrimitive(felgp_fs.dilate, [torch.Tensor], torch.Tensor, name="Dilate")
+
+pset.addPrimitive(felgp_fs.mix, [torch.Tensor, torch.Tensor, float], torch.Tensor, name="Mix")
+pset.addPrimitive(felgp_fs.if_then_else, [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, name="IfElse")
+pset.addPrimitive(felgp_fs.open_f, [torch.Tensor], torch.Tensor, name="Open")
+pset.addPrimitive(felgp_fs.close_f, [torch.Tensor], torch.Tensor, name="Close")
+pset.addPrimitive(felgp_fs.gaussian_blur_param, [torch.Tensor, float], torch.Tensor, name="Gauss")
+
+
 #Terminals
-pset.renameArguments(ARG0='grey')
-def rand_sigma():
-    return random.randint(1, 4)
+# Float thresholds for Gt/Lt (use a named function for multiprocessing pickling)
+def rand_thresh():
+    return float(np.random.uniform(0.05, 0.95))
+pset.addEphemeralConstant('Thresh', rand_thresh, float)
+def rand_alpha(): return float(np.random.uniform(0.0, 1.0))
+pset.addEphemeralConstant('Alpha', rand_alpha, float)
 
-def rand_order():
-    return random.randint(0, 3)
-
-def rand_theta():
-    return random.randint(0, 8)
-
-def rand_frequency():
-    return random.randint(0, 5)
-
-def rand_n():
-    return round(random.random(), 3)
-
-def rand_kernel_size():
-    return random.randrange(2, 5, 2)
-
-def rand_c():
-    return random.randint(-2, 5)
-
-def rand_num_tree():
-    return random.randrange(50, 501, 10)
-
-def rand_tree_depth():
-    return random.randrange(10, 101, 10)
-
-pset.addEphemeralConstant('Singma', rand_sigma, Int1)
-pset.addEphemeralConstant('Order', rand_order, Int2)
-pset.addEphemeralConstant('Theta', rand_theta, Float1)
-pset.addEphemeralConstant('Frequency', rand_frequency, Float2)
-pset.addEphemeralConstant('n', rand_n, Float3)
-pset.addEphemeralConstant('KernelSize', rand_kernel_size, Int3)
-pset.addEphemeralConstant('C', rand_c, Int4)
-pset.addEphemeralConstant('num_Tree', rand_num_tree, Int5)
-pset.addEphemeralConstant('tree_Depth', rand_tree_depth, Int6)
 ##
 creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMax) # type: ignore
@@ -153,8 +149,19 @@ toolbox.register("population", tools.initRepeat, list, toolbox.individual) # typ
 toolbox.register("compile", gp.compile, pset=pset)
 toolbox.register("mapp", pool.map)
 
+_dbg_train_printed = False
+_dbg_test_printed = False
 
-def evalTrain(toolbox, individual, hof, trainData, trainLabel):
+def _binarize_from_logits(logits):
+    # Robust: handle NaNs/Infs and non-float outputs
+    if not logits.dtype.is_floating_point:
+        logits = logits.float()
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+    probs = torch.sigmoid(logits)
+    preds = (probs > 0.5).float()
+    return preds, probs
+
+def evalTrain(toolbox, individual, hof):
     """
     Evaluate the fitness of an individual on the training data.
     If the individual is in the Hall of Fame, reuse its fitness.
@@ -171,25 +178,41 @@ def evalTrain(toolbox, individual, hof, trainData, trainLabel):
     Returns:
         Tuple containing accuracy as a single-element tuple.
     """
-    if len(hof) != 0 and individual in hof:
-        ind = 0
-        while ind < len(hof):
-            if individual == hof[ind]:
-                accuracy, = hof[ind].fitness.values
-                ind = len(hof)
-            else: ind+=1
-    else:
-        try:
-            func = toolbox.compile(expr=individual)
-            output = np.asarray(func(trainData, trainLabel))
-            y_predict  = np.argmax(output, axis=1)
-            accuracy = 100*np.sum(y_predict == trainLabel) / len(trainLabel)
-        except:
-            accuracy=0
-    return accuracy,
+    # Check if individual is in Hall of Fame
+    for h in (hof or []):
+        if individual == h:
+            return h.fitness.values
+    try:
+        func = toolbox.compile(expr=individual)
+        dice_scores = []
+        with torch.no_grad():
+            for imgs, masks in train_loader:
+                imgs, masks = imgs.to(device), masks.to(device)
+                out = func(imgs)
+                preds, probs = _binarize_from_logits(out)
+
+                # one-time debug
+                global _dbg_train_printed
+                if not _dbg_train_printed:
+                    print(f"[DBG train] imgs[min,max]=[{imgs.min().item():.3f},{imgs.max().item():.3f}] "
+                          f"masks[min,max]=[{masks.min().item():.3f},{masks.max().item():.3f}] "
+                          f"probs[min,max]=[{probs.min().item():.3f},{probs.max().item():.3f}] "
+                          f"preds_mean={preds.mean().item():.4f} "
+                          f"any_nan_out={torch.isnan(out).any().item()}")
+                    _dbg_train_printed = True
+
+                inter = (preds * masks).sum()
+                union = preds.sum() + masks.sum()
+                dice = (2.0 * inter / (union + 1e-6)).item()
+                dice_scores.append(dice)
+        mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
+    except Exception as e:
+        print("Evaluation error:", e)
+        mean_dice = 0.0
+    return (mean_dice,)
 
 
-toolbox.register("evaluate", evalTrain,toolbox, trainData=x_train,trainLabel=y_train)
+toolbox.register("evaluate", evalTrain,toolbox)
 toolbox.register("select", tools.selTournament,tournsize=7)
 toolbox.register("selectElitism", tools.selBest)
 toolbox.register("mate", gp.cxOnePoint)
@@ -232,30 +255,40 @@ def GPMain(randomSeeds):
 
     return pop,log, hof
 
-def evalTest(toolbox, individual, trainData, trainLabel, test, testL):
-    """
-    Evaluate the best individual on the test set.
-    Concatenates train and test data, compiles and executes the individual,
-    and computes classification accuracy on the test set.
 
+def evalTest(toolbox, individual, test_loader):
+    """
+    Evaluate the GP individual on the test set.
     Args:
         toolbox: DEAP toolbox with compile method.
         individual: The GP individual to evaluate.
-        trainData: Training data (features).
-        trainLabel: Training labels.
-        test: Test data (features).
-        testL: Test labels.
-
+        test_loader: DataLoader for the test dataset.
     Returns:
-        accuracy: Classification accuracy on the test set (percentage).
+        Mean Dice score on the test set.
     """
-    x_train = np.concatenate((trainData, test), axis=0)
     func = toolbox.compile(expr=individual)
-    output = np.asarray(func(x_train, trainLabel))
-    print(output.shape)
-    y_predict = np.argmax(output, axis=1)
-    accuracy = 100*np.sum(y_predict==testL)/len(testL)
-    return accuracy
+    dice_scores = []
+    with torch.no_grad():
+        for imgs, masks in test_loader:
+            imgs, masks = imgs.to(device), masks.to(device)
+            out = func(imgs)
+            preds, probs = _binarize_from_logits(out)
+
+            # one-time debug
+            global _dbg_test_printed
+            if not _dbg_test_printed:
+                print(f"[DBG test] imgs[min,max]=[{imgs.min().item():.3f},{imgs.max().item():.3f}] "
+                      f"masks[min,max]=[{masks.min().item():.3f},{masks.max().item():.3f}] "
+                      f"probs[min,max]=[{probs.min().item():.3f},{probs.max().item():.3f}] "
+                      f"preds_mean={preds.mean().item():.4f} "
+                      f"any_nan_out={torch.isnan(out).any().item()}")
+                _dbg_test_printed = True
+
+            intersection = (preds * masks).sum()
+            union = preds.sum() + masks.sum()
+            dice = (2. * intersection / (union + 1e-6)).item()
+            dice_scores.append(dice)
+    return np.mean(dice_scores)
 
 if __name__ == "__main__":
     beginTime = time.process_time()
@@ -263,8 +296,11 @@ if __name__ == "__main__":
     endTime = time.process_time()
     trainTime = endTime - beginTime
 
-    testResults = evalTest(toolbox, hof[0], x_train, y_train,x_test, y_test)
+    testResults = evalTest(toolbox, hof[0], test_loader)
     saveFile.saveAllResults(randomSeeds, dataSetName, hof, trainTime, testResults, log)
+
+    # Optional: visualize predictions from the best individual
+    visualize_predictions(toolbox, hof[0], test_dataset, num_samples=3, threshold=0.5, save_dir="outputs/vis")
 
     testTime = time.process_time() - endTime
     print('testResults ', testResults)
