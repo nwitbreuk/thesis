@@ -1,19 +1,8 @@
 import torch
 import torch.nn.functional as F   # <-- this defines F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'   # <-- this defines device
-import sift_features
-import numpy
-from scipy import ndimage
-from skimage.filters import gabor
-import skimage
-from skimage.feature import local_binary_pattern
-from skimage.feature import hog
-import numpy as np
-from sklearn.svm import LinearSVC
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn import preprocessing
-from sklearn.model_selection import StratifiedKFold
-from sklearn.linear_model import LogisticRegression
+import torchvision.models.segmentation as seg_models
+import torch.nn as nn
 
 # region ==== Combination Functions ====
 
@@ -95,125 +84,48 @@ def xor(x, y): return torch.abs(x - y)
 
 
 # endregion
-# region ==== Feature Extraction Functions ====
-# def conVector(img):
-#     """
-#     Concatenate image arrays into a vector.
-#     Args:
-#         img: Image or list of arrays.
-#     Returns:
-#         Flattened vector.
-#     """
-#     try:
-#         img_vector=numpy.concatenate((img))
-#     except:
-#         img_vector=img
-#     return img_vector
 
-# def histLBP(image, radius, n_points):
-#     """
-#     Compute the histogram of Local Binary Pattern (LBP) features for an image.
-#     Args:
-#         image: Input image.
-#         radius: Radius for LBP.
-#         n_points: Number of points for LBP.
-#     Returns:
-#         LBP histogram.
-#     """
-#     lbp = local_binary_pattern(image, n_points, radius, method='nri_uniform')
-#     n_bins = 59
-#     hist, ax = numpy.histogram(lbp, n_bins, (0, 59))
-#     return hist
+# region ==== NN primitives ====
 
-# def all_lbp(image):
-#     """
-#     Compute LBP histograms for all images in a batch.
-#     Args:
-#         image: Batch of images.
-#     Returns:
-#         Array of LBP histograms.
-#     """
-#     feature = []
-#     for i in range(image.shape[0]):
-#         feature_vector = histLBP(image[i,:,:], radius=1.5, n_points=8)
-#         feature.append(feature_vector)
-#     return numpy.asarray(feature)
 
-# def HoGFeatures(image):
-#     """
-#     Compute Histogram of Oriented Gradients (HoG) features for an image.
-#     Args:
-#         image: Input image.
-#     Returns:
-#         HoG feature image or original image if computation fails.
-#     """
-#     try:
-#         img, realImage = hog(image, orientations=9, pixels_per_cell=(8, 8),
-#                     cells_per_block=(3, 3), block_norm='L2-Hys', visualize=True,
-#                     transform_sqrt=False, feature_vector=True)
-#         return realImage
-#     except:
-#         return image
+# Load and freeze a pre-trained segmentation model (DeepLabV3 with ResNet50 backbone)
+# Pre-trained on COCO; outputs 21 classes, but we'll use class 18 (horse) or adapt for binary
+_pretrained_seg_model = seg_models.deeplabv3_resnet50(pretrained=True).to(device)
+_pretrained_seg_model.eval()
+for param in _pretrained_seg_model.parameters():
+    param.requires_grad = False  # Freeze the model
 
-# def hog_features_patches(image, patch_size, moving_size):
-#     """
-#     Compute HoG features for patches in an image.
-#     Args:
-#         image: Input image.
-#         patch_size: Size of each patch.
-#         moving_size: Step size for moving window.
-#     Returns:
-#         Array of HoG features for patches.
-#     """
-#     img = numpy.asarray(image)
-#     width, height = img.shape
-#     w = int(width / moving_size)
-#     h = int(height / moving_size)
-#     patch = []
-#     for i in range(0, w):
-#         for j in range(0, h):
-#             patch.append([moving_size * i, moving_size * j])
-#     hog_features = numpy.zeros((len(patch)))
-#     realImage = HoGFeatures(img)
-#     for i in range(len(patch)):
-#         hog_features[i] = numpy.mean(
-#             realImage[patch[i][0]:(patch[i][0] + patch_size), patch[i][1]:(patch[i][1] + patch_size)])
-#     return hog_features
+def pretrained_seg_nn(x):
+    """
+    Apply pre-trained segmentation NN to input tensor x (C,H,W).
+    Assumes x is RGB (3 channels); outputs a binary segmentation map (1,H,W) for "horse" class.
+    """
+    if x.shape[0] != 3:
+        # If not RGB, replicate grayscale to 3 channels (hack for grayscale inputs)
+        x = x.repeat(3, 1, 1) if x.shape[0] == 1 else x[:3]  # Take first 3 if more
+    
+    with torch.no_grad():
+        # Normalize to ImageNet stats (required for pre-trained models)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(3, 1, 1)
+        x_norm = (x - mean) / std
+        
+        # Forward pass
+        out = _pretrained_seg_model(x_norm.unsqueeze(0))['out']  # Add batch dim; output shape (1,21,H,W)
+        
+        # Extract horse class (class 18 in COCO) and sigmoid for probability
+        horse_prob = torch.sigmoid(out[:, 18:19])  # (1,1,H,W)
+        return horse_prob.squeeze(0)  # (1,H,W)
 
-# def global_hog_small(image):
-#     """
-#     Compute HoG features for all images in a batch using small patches.
-#     Args:
-#         image: Batch of images.
-#     Returns:
-#         Array of HoG features.
-#     """
-#     feature = []
-#     for i in range(image.shape[0]):
-#         feature_vector = hog_features_patches(image[i,:,:], 4, 4)
-#         feature.append(feature_vector)
-#     return numpy.asarray(feature)
 
-# def all_sift(image):
-#     """
-#     Compute SIFT features for all images in a batch.
-#     Args:
-#         image: Batch of images.
-#     Returns:
-#         Array of SIFT feature vectors.
-#     """
-#     width, height = image[0, :, :].shape
-#     min_length = numpy.min((width, height))
-#     feature = []
-#     for i in range(image.shape[0]):
-#         img = numpy.asarray(image[i, 0:width, 0:height])
-#         extractor = sift_features.SingleSiftExtractor(min_length)
-#         feaArrSingle = extractor.process_image(img[0:min_length, 0:min_length])
-#         w, h = feaArrSingle.shape
-#         feature_vector = numpy.reshape(feaArrSingle, (h,))
-#         feature.append(feature_vector)
-#     return numpy.asarray(feature)
+
+
 # endregion
+
+# region ==== Feature Extraction Functions ====
+
+# endregion
+
 # region ==== Filtering & edge detection Functions ====
 
 # Sobel and Laplacian filters
