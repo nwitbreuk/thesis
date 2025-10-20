@@ -1,8 +1,28 @@
 import torch
 import torch.nn.functional as F   # <-- this defines F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'   # <-- this defines device
-import torchvision.models.segmentation as seg_models
+from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
 import torch.nn as nn
+
+
+# Helpers
+def _as_nchw(x: torch.Tensor) -> torch.Tensor:
+    # Accept (H,W), (C,H,W) or (B,C,H,W); return (B,C,H,W)
+    if x.dim() == 2:
+        x = x.unsqueeze(0).unsqueeze(0)         # (1,1,H,W)
+    elif x.dim() == 3:
+        x = x.unsqueeze(0)                       # (1,C,H,W)
+    elif x.dim() != 4:
+        raise ValueError(f"Expected 2D/3D/4D, got shape {tuple(x.shape)}")
+    return x
+
+def _restore_like(y: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    # Return to 2D/3D if input was 2D/3D
+    if like.dim() == 2:      # (H,W)
+        return y.squeeze(0).squeeze(0)
+    if like.dim() == 3:      # (C,H,W)
+        return y.squeeze(0)
+    return y   
 
 # region ==== Combination Functions ====
 
@@ -33,22 +53,17 @@ def if_then_else(cond, a, b):
     return cond * a + (1.0 - cond) * b
 
 def gaussian_blur_param(x, sigma: float):
-    """
-    Apply Gaussian blur to a tensor with a specified sigma.
-    Args:
-        x: Input tensor of shape (B, C, H, W).
-        sigma: Standard deviation for Gaussian kernel.
-    Returns:
-        Blurred tensor.
-    """
-    # sigma in [0.5, 3]; auto kernel size
-    sigma = float(max(0.5, min(3.0, sigma)))
-    k = int(max(3, 2 * int(3 * sigma) + 1))
+    xin = x
+    x = _as_nchw(x)
+    B, C, H, W = x.shape
+    sigma = float(max(0.5, min(5.0, sigma)))
+    k = max(3, 2 * int(3 * sigma) + 1)
     ax = torch.arange(-k // 2 + 1., k // 2 + 1., device=x.device)
     g1 = torch.exp(-0.5 * (ax / sigma) ** 2)
     g1 = g1 / g1.sum()
-    k2 = torch.outer(g1, g1).unsqueeze(0).unsqueeze(0)
-    return F.conv2d(x, k2, padding=k // 2)
+    k2 = torch.outer(g1, g1).unsqueeze(0).unsqueeze(0).repeat(C, 1, 1, 1)  # (C,1,k,k)
+    y = F.conv2d(x, k2, padding=k // 2, groups=C)
+    return _restore_like(y, xin)
 
 # endregion
 # region ==== Basic Math operators ====
@@ -90,32 +105,36 @@ def xor(x, y): return torch.abs(x - y)
 
 # Load and freeze a pre-trained segmentation model (DeepLabV3 with ResNet50 backbone)
 # Pre-trained on COCO; outputs 21 classes, but we'll use class 18 (horse) or adapt for binary
-_pretrained_seg_model = seg_models.deeplabv3_resnet50(pretrained=True).to(device)
-_pretrained_seg_model.eval()
-for param in _pretrained_seg_model.parameters():
-    param.requires_grad = False  # Freeze the model
+# Load weights with proper meta (silences deprecated warnings)
+_WEIGHTS = DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1
+_PRETRAINED = deeplabv3_resnet50(weights=_WEIGHTS).to(device).eval()
+for p in _PRETRAINED.parameters():
+    p.requires_grad_(False)
 
-def pretrained_seg_nn(x):
+_MEAN = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+_STD  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+_CATS = _WEIGHTS.meta.get("categories", [])
+_HORSE_IDX = (_CATS.index("horse") if "horse" in _CATS else 13)  # VOC index for 'horse' fallback
+
+@torch.no_grad()
+def pretrained_seg_nn(x: torch.Tensor) -> torch.Tensor:
     """
-    Apply pre-trained segmentation NN to input tensor x (C,H,W).
-    Assumes x is RGB (3 channels); outputs a binary segmentation map (1,H,W) for "horse" class.
+    Accepts (H,W), (1,H,W), (3,H,W) or (B,C,H,W).
+    - If grayscale (C=1), replicate to 3 channels.
+    - Normalize with weights meta.
+    - Returns logits for 'horse' as (same batch shape, 1, H, W).
     """
-    if x.shape[0] != 3:
-        # If not RGB, replicate grayscale to 3 channels (hack for grayscale inputs)
-        x = x.repeat(3, 1, 1) if x.shape[0] == 1 else x[:3]  # Take first 3 if more
-    
-    with torch.no_grad():
-        # Normalize to ImageNet stats (required for pre-trained models)
-        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(3, 1, 1)
-        x_norm = (x - mean) / std
-        
-        # Forward pass
-        out = _pretrained_seg_model(x_norm.unsqueeze(0))['out']  # Add batch dim; output shape (1,21,H,W)
-        
-        # Extract horse class (class 18 in COCO) and sigmoid for probability
-        horse_prob = torch.sigmoid(out[:, 18:19])  # (1,1,H,W)
-        return horse_prob.squeeze(0)  # (1,H,W)
+    xin = x
+    x = _as_nchw(x).to(device)          # (B,C,H,W)
+    if x.shape[1] == 1:
+        x = x.repeat(1, 3, 1, 1)
+    elif x.shape[1] > 3:
+        x = x[:, :3]
+
+    x = (x - _MEAN) / _STD
+    out = _PRETRAINED(x)["out"]         # (B,21,H,W)
+    horse_logits = out[:, _HORSE_IDX:_HORSE_IDX+1]  # (B,1,H,W)
+    return _restore_like(horse_logits, xin)
 
 
 
@@ -129,53 +148,33 @@ def pretrained_seg_nn(x):
 # region ==== Filtering & edge detection Functions ====
 
 # Sobel and Laplacian filters
-sobel_x_kernel = torch.tensor([[[-1, 0, 1],
-                                [-2, 0, 2],
-                                [-1, 0, 1]]], dtype=torch.float32, device=device).unsqueeze(0)
-sobel_y_kernel = torch.tensor([[[-1, -2, -1],
-                                [ 0,  0,  0],
-                                [ 1,  2,  1]]], dtype=torch.float32, device=device).unsqueeze(0)
-laplacian_kernel = torch.tensor([[[0, 1, 0],
-                                  [1, -4, 1],
-                                  [0, 1, 0]]], dtype=torch.float32, device=device).unsqueeze(0)
+sobel_x_kernel = torch.tensor([[-1, 0, 1],
+                               [-2, 0, 2],
+                               [-1, 0, 1]], dtype=torch.float32, device=device)
+sobel_y_kernel = torch.tensor([[-1, -2, -1],
+                               [ 0,  0,  0],
+                               [ 1,  2,  1]], dtype=torch.float32, device=device)
+laplacian_kernel = torch.tensor([[0, 1, 0],
+                                 [1,-4, 1],
+                                 [0, 1, 0]], dtype=torch.float32, device=device)
 
-def conv2d(x, kernel):
-    return F.conv2d(x, kernel, padding=1)
+def _depthwise_conv(x: torch.Tensor, k2d: torch.Tensor, pad: int) -> torch.Tensor:
+    xin = x
+    x = _as_nchw(x)
+    B, C, H, W = x.shape
+    k = k2d.to(x.device)
+    if k.dim() == 2:
+        k = k.unsqueeze(0).unsqueeze(0)        # (1,1,kh,kw)
+    weight = k.repeat(C, 1, 1, 1)              # (C,1,kh,kw)
+    y = F.conv2d(x, weight, padding=pad, groups=C)
+    return _restore_like(y, xin)
 
-def sobel_x(x): return conv2d(x, sobel_x_kernel)
-def sobel_y(x): return conv2d(x, sobel_y_kernel)
-def laplacian(x): return conv2d(x, laplacian_kernel)
+def sobel_x(x):   return _depthwise_conv(x, sobel_x_kernel, pad=1)
+def sobel_y(x):   return _depthwise_conv(x, sobel_y_kernel, pad=1)
+def laplacian(x): return _depthwise_conv(x, laplacian_kernel, pad=1)
 
 def gradient_magnitude(x):
     gx, gy = sobel_x(x), sobel_y(x)
-    return torch.sqrt(gx ** 2 + gy ** 2)
-
-def erode(x, k=3):
-    return -F.max_pool2d(-x, kernel_size=k, stride=1, padding=k//2)
-
-def dilate(x, k=3):
-    return F.max_pool2d(x, kernel_size=k, stride=1, padding=k//2)
-
-def open_f(x, k=3):
-    return dilate(erode(x, k), k)
-
-def close_f(x, k=3):
-    return erode(dilate(x, k), k)
+    return torch.sqrt(gx * gx + gy * gy + 1e-12)
 
 
-def gaussian_blur(x, k=5, sigma=1.0):
-    def get_gaussian_kernel(k, sigma):
-        ax = torch.arange(-k // 2 + 1., k // 2 + 1.)
-        kernel = torch.exp(-0.5 * (ax / sigma) ** 2)
-        kernel = kernel / kernel.sum()
-        return kernel
-    gk = get_gaussian_kernel(k, sigma).to(device)
-    kernel2d = torch.outer(gk, gk).unsqueeze(0).unsqueeze(0)
-    return F.conv2d(x, kernel2d, padding=k//2)
-
-def mean_filter(x, k=3):
-    kernel = torch.ones((1, 1, k, k), device=device) / (k * k)
-    return F.conv2d(x, kernel, padding=k//2)
-
-
-# endregion

@@ -55,7 +55,7 @@ def pad_collate(batch):
         pad_masks.append(F.pad(ms, pad, value=0.0))
     return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
-FAST_MODE = True  # set False for full run
+FAST_MODE = False  # set False for full run
 
 # parameters (shrink for fast iteration)
 pop_size   = 10 if FAST_MODE else 50
@@ -119,14 +119,11 @@ pset.addPrimitive(felgp_fs.sobel_x, [torch.Tensor], torch.Tensor, name="SobelX")
 pset.addPrimitive(felgp_fs.sobel_y, [torch.Tensor], torch.Tensor, name="SobelY")
 pset.addPrimitive(felgp_fs.laplacian, [torch.Tensor], torch.Tensor, name="Laplacian")
 pset.addPrimitive(felgp_fs.gradient_magnitude, [torch.Tensor], torch.Tensor, name="GradientMagnitude")
-pset.addPrimitive(felgp_fs.erode, [torch.Tensor], torch.Tensor, name="Erode")
-pset.addPrimitive(felgp_fs.dilate, [torch.Tensor], torch.Tensor, name="Dilate")
+
 
 # Morphological and other image processing functions
 pset.addPrimitive(felgp_fs.mix, [torch.Tensor, torch.Tensor, float], torch.Tensor, name="Mix")
 pset.addPrimitive(felgp_fs.if_then_else, [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, name="IfElse")
-pset.addPrimitive(felgp_fs.open_f, [torch.Tensor], torch.Tensor, name="Open")
-pset.addPrimitive(felgp_fs.close_f, [torch.Tensor], torch.Tensor, name="Close")
 pset.addPrimitive(felgp_fs.gaussian_blur_param, [torch.Tensor, float], torch.Tensor, name="Gauss")
 
 # Pretrained segmentation NN
@@ -161,6 +158,9 @@ def _binarize_from_logits(logits):
     if not logits.dtype.is_floating_point:
         logits = logits.float()
     logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+    # Reduce to single channel if multi-channel
+    if logits.dim() == 4 and logits.shape[1] > 1:
+        logits = logits.mean(dim=1, keepdim=True)
     probs = torch.sigmoid(logits)
     preds = (probs > 0.5).float()
     return preds, probs
