@@ -300,7 +300,7 @@ if __name__ == "__main__":
     saveFile.saveAllResults(randomSeeds, dataSetName, hof, trainTime, testResults, log)
 
     # Optional: visualize predictions from the best individual
-    visualize_predictions(toolbox, hof[0], test_dataset, num_samples=3, threshold=0.5, save_dir="outputs/vis")
+    visualize_predictions(toolbox, hof[0], test_dataset, num_samples=3, threshold=0.5, save_dir="/dataB1/niels_witbreuk/logs/visualizations")
 
     testTime = time.process_time() - endTime
     print('testResults ', testResults)
