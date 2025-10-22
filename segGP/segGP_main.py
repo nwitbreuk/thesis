@@ -25,15 +25,17 @@ creator.FitnessMax: Any  # type: ignore
 creator.Individual: Any  # type: ignore
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-RUN_NAME="exp_color-fast-test"
-RUN_MODE = "fast"  # "fast", "middle", "normal"
-randomSeeds = 12
-
 dataSetName = 'weizmann_horse'
 image_dir = "data/weizmann_horse/horse"
 mask_dir = "data/weizmann_horse/mask"
 dataset = WeizmannHorseDataset(image_dir, mask_dir)
 RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
+
+RUN_MODE = "normal"  # "fast", "middle", "normal"
+randomSeeds = 12
+RUN_NAME=f"{dataSetName}_{RUN_MODE}mode_seed{randomSeeds}_{{jid}}"
+# _make_run_dir will replace {jid} with SLURM_JOB_ID (or process id if not running under SLURM)
+
 
 def pad_collate(batch):
     """
