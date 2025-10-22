@@ -77,10 +77,23 @@ def sqrt_f(x): return torch.sqrt(torch.clamp(x, min=0))
 def log_f(x): return torch.log1p(torch.abs(x))
 def exp_f(x): return torch.exp(torch.clamp(x, max=10))
 
+def _restore_shape(y: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    # Return to 2D/3D if input was 2D/3D
+    if like.dim() == 2:      # (H,W)
+        return y.squeeze(0).squeeze(0)
+    if like.dim() == 3:      # (C,H,W)
+        return y.squeeze(0)
+    return y
+
 # normalization and activation functions
-def normalize(x):
-    x_min, x_max = x.min(), x.max()
-    return (x - x_min) / (x_max - x_min + 1e-6)
+def normalize(x: torch.Tensor) -> torch.Tensor:
+    xin = x
+    x = _as_nchw(x)
+    B, C, H, W = x.shape
+    mean = x.view(B, C, -1).mean(dim=2).view(B, C, 1, 1)
+    std = x.view(B, C, -1).std(dim=2).view(B, C, 1, 1) + 1e-6
+    y = (x - mean) / std
+    return _restore_shape(y, xin)
 
 def sigmoid(x): return torch.sigmoid(x)
 def tanh_f(x): return torch.tanh(x)
@@ -142,6 +155,7 @@ def pretrained_seg_nn(x: torch.Tensor) -> torch.Tensor:
 # endregion
 
 # region ==== Feature Extraction Functions ====
+
 
 # endregion
 

@@ -4,6 +4,7 @@ import argparse
 
 import subprocess
 import random
+import traceback
 import torch
 from torch.utils.data import random_split, DataLoader
 import os
@@ -119,6 +120,7 @@ params = {
 pset = gp.PrimitiveSetTyped('MAIN', [torch.Tensor], torch.Tensor, prefix='Image')
 
 # Add arithmetic
+
 pset.addPrimitive(felgp_fs.add, [torch.Tensor, torch.Tensor], torch.Tensor, name="Add")
 pset.addPrimitive(felgp_fs.sub, [torch.Tensor, torch.Tensor], torch.Tensor, name="Sub")
 pset.addPrimitive(felgp_fs.mul, [torch.Tensor, torch.Tensor], torch.Tensor, name="Mul")
@@ -150,6 +152,8 @@ pset.addPrimitive(felgp_fs.gaussian_blur_param, [torch.Tensor, float], torch.Ten
 pset.addPrimitive(felgp_fs.pretrained_seg_nn, [torch.Tensor], torch.Tensor, name="PretrainedSeg")
 
 
+
+
 #Terminals
 # Float thresholds for Gt/Lt (use a named function for multiprocessing pickling)
 def rand_thresh():
@@ -157,6 +161,8 @@ def rand_thresh():
 pset.addEphemeralConstant('Thresh', rand_thresh, float)
 def rand_alpha(): return float(np.random.uniform(0.0, 1.0))
 pset.addEphemeralConstant('Alpha', rand_alpha, float)
+def rand_channel(): return random.randint(0, 2)
+pset.addEphemeralConstant('ChannelIdx', rand_channel, int)
 
 ##
 creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -173,10 +179,17 @@ toolbox.register("mapp", pool.map)
 _dbg_train_printed = False
 _dbg_test_printed = False
 
+def _ensure_single_channel(out: torch.Tensor) -> torch.Tensor:
+    # out: (N,C,H,W). If C>1, reduce to 1 via mean.
+    if out.dim() == 4 and out.shape[1] > 1:
+        out = out.mean(dim=1, keepdim=True)
+    return out
+
 def _binarize_from_logits(logits):
     # Robust: handle NaNs/Infs and non-float outputs
     if not logits.dtype.is_floating_point:
         logits = logits.float()
+    logits = _ensure_single_channel(logits)
     logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
     # Reduce to single channel if multi-channel
     if logits.dim() == 4 and logits.shape[1] > 1:
@@ -232,6 +245,7 @@ def evalTrain(toolbox, individual, hof):
         mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
     except Exception as e:
         print("Evaluation error:", e)
+        traceback.print_exc()
         mean_dice = 0.0
     return (mean_dice,)
 
