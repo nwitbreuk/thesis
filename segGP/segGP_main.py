@@ -58,17 +58,31 @@ def pad_collate(batch):
         pad_masks.append(F.pad(ms, pad, value=0.0))
     return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
-FAST_MODE = True  # set False for full run
+RUN_MODE = "middle"  # "fast", "middle", "normal"
 
-# parameters (shrink for fast iteration)
-pop_size   = 10 if FAST_MODE else 50
-generation = 5  if FAST_MODE else 30
+# Presets per mode
+_PRESETS = {
+    "fast":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 4, "cap_train": 80,  "cap_test": 32},
+    "middle": {"pop_size": 25, "generation": 15, "initialMaxDepth": 7, "maxDepth": 7,  "batch_size": 6, "cap_train": 200, "cap_test": 80},
+    "normal": {"pop_size": 50, "generation": 30, "initialMaxDepth": 8, "maxDepth": 8,  "batch_size": 8, "cap_train": None, "cap_test": None},
+}
+preset = _PRESETS[RUN_MODE]
+
+# GP hyperparams (common values for all modes)
 cxProb     = 0.8
 mutProb    = 0.19
 elitismProb= 0.01
 initialMinDepth = 2
-initialMaxDepth = 6 if FAST_MODE else 8
-maxDepth        = 6 if FAST_MODE else 8
+
+# Mode-dependent
+pop_size = preset["pop_size"]
+generation = preset["generation"]
+initialMaxDepth = preset["initialMaxDepth"]
+maxDepth = preset["maxDepth"]
+_MODE_BATCH_SIZE = preset["batch_size"]
+_MODE_CAP_TRAIN = preset["cap_train"]
+_MODE_CAP_TEST = preset["cap_test"]
+
 
 
 
@@ -80,29 +94,29 @@ train_dataset, test_dataset = random_split(
     generator=torch.Generator().manual_seed(42)
 )
 
-if FAST_MODE:
-    # cap the number of samples used
+# Optionally cap dataset sizes for faster modes
+if _MODE_CAP_TRAIN is not None or _MODE_CAP_TEST is not None:
     from torch.utils.data import Subset
-    max_train = 80
-    max_test  = 32
+    max_train = _MODE_CAP_TRAIN or len(train_dataset)
+    max_test  = _MODE_CAP_TEST or len(test_dataset)
     train_idx = list(range(min(max_train, len(train_dataset))))
     test_idx  = list(range(min(max_test, len(test_dataset))))
     train_dataset = Subset(train_dataset, train_idx)
-    test_dataset  = Subset(test_dataset, test_idx)
+  
 
 # DataLoaders: increase workers and pin memory for CUDA
 num_workers = min(4, os.cpu_count() or 1)
 pin = (device == 'cuda')
-train_loader = DataLoader(train_dataset, batch_size=8 if not FAST_MODE else 4,
-                          shuffle=True, collate_fn=pad_collate,
-                          num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
-test_loader  = DataLoader(test_dataset, batch_size=8 if not FAST_MODE else 4,
+train_loader = DataLoader(train_dataset, batch_size=_MODE_BATCH_SIZE,
+                           shuffle=True, collate_fn=pad_collate,
+                           num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
+test_loader  = DataLoader(test_dataset, batch_size=_MODE_BATCH_SIZE,
                           shuffle=False, collate_fn=pad_collate,
                           num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
 
 params = {
         "Dataset": dataSetName,
-        "FAST_MODE": FAST_MODE,
+        "RUN_MODE": RUN_MODE,
         "randomSeeds": randomSeeds,
         "pop_size": pop_size,
         "generation": generation,
