@@ -1,5 +1,8 @@
 #python packages
 import operator
+import argparse
+
+import subprocess
 import random
 import torch
 from torch.utils.data import random_split, DataLoader
@@ -18,8 +21,7 @@ from typing import Any
 from visualize import visualize_predictions
 
 # defined by author
-import saveFile
-import sys
+import data_handling as data_handling
 
 toolbox: base.Toolbox  # type: ignore
 creator.FitnessMax: Any  # type: ignore
@@ -55,7 +57,7 @@ def pad_collate(batch):
         pad_masks.append(F.pad(ms, pad, value=0.0))
     return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
-FAST_MODE = False  # set False for full run
+FAST_MODE = True  # set False for full run
 
 # parameters (shrink for fast iteration)
 pop_size   = 10 if FAST_MODE else 50
@@ -66,6 +68,8 @@ elitismProb= 0.01
 initialMinDepth = 2
 initialMaxDepth = 6 if FAST_MODE else 8
 maxDepth        = 6 if FAST_MODE else 8
+
+
 
 # Split and optionally cap train/test sizes
 full_train_size = int(0.8 * len(dataset))
@@ -94,6 +98,22 @@ train_loader = DataLoader(train_dataset, batch_size=8 if not FAST_MODE else 4,
 test_loader  = DataLoader(test_dataset, batch_size=8 if not FAST_MODE else 4,
                           shuffle=False, collate_fn=pad_collate,
                           num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
+
+params = {
+        "Dataset": dataSetName,
+        "FAST_MODE": FAST_MODE,
+        "randomSeeds": randomSeeds,
+        "pop_size": pop_size,
+        "generation": generation,
+        "cxProb": cxProb,
+        "mutProb": mutProb,
+        "elitismProb": elitismProb,
+        "initialMinDepth": initialMinDepth,
+        "initialMaxDepth": initialMaxDepth,
+        "maxDepth": maxDepth,
+        "train_batch_size": train_loader.batch_size,
+        "test_batch_size": test_loader.batch_size
+    }
 
 ##GP
 pset = gp.PrimitiveSetTyped('MAIN', [torch.Tensor], torch.Tensor, prefix='Image')
@@ -294,18 +314,33 @@ def evalTest(toolbox, individual, test_loader):
             dice_scores.append(dice)
     return np.mean(dice_scores)
 
+
 if __name__ == "__main__":
-    beginTime = time.process_time()
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--outdir", type=str, default=None)
+    parser.add_argument("--run-branch", type=str, default=None,
+                        help="(optional) attempt to git checkout this branch before running")
+    parser.add_argument("--no-git-check", action="store_true",
+                        help="do not attempt to call git; use env vars or detect only")
+    args, _unknown = parser.parse_known_args()
+
+    start = time.process_time()
     pop, log, hof = GPMain(randomSeeds)
-    endTime = time.process_time()
-    trainTime = endTime - beginTime
+    trainTime = time.process_time() - start
+
+    run_dir, meta = data_handling._make_run_dir(args, dataSetName, randomSeeds)
 
     testResults = evalTest(toolbox, hof[0], test_loader)
-    saveFile.saveAllResults(randomSeeds, dataSetName, hof, trainTime, testResults, log)
+    # pass meta/args/randomSeeds so run info is embedded in the single summary file
+    data_handling.saveAllResults(params, hof, trainTime, testResults, log, outdir=run_dir, meta=meta, args=args, randomSeeds=randomSeeds)
+    visualize_predictions(toolbox, hof[0], test_dataset, num_samples=3, threshold=0.5,
+                          save_dir=os.path.join(run_dir, "visualizations"))
 
-    # Optional: visualize predictions from the best individual
-    visualize_predictions(toolbox, hof[0], test_dataset, num_samples=3, threshold=0.5, save_dir="/dataB1/niels_witbreuk/logs/visualizations")
+    data_handling._copy_slurm_logs(run_dir, meta)
+    print("testResults", testResults)
 
-    testTime = time.process_time() - endTime
-    print('testResults ', testResults)
+
+    data_handling.saveAllResults(params, hof, trainTime, testResults, log, outdir=run_dir)
 
