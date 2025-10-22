@@ -1,8 +1,5 @@
-#python packages
 import operator
 import argparse
-
-import subprocess
 import random
 import traceback
 import torch
@@ -20,22 +17,23 @@ from deap import base, creator, tools, gp
 import seggp_functions as felgp_fs
 from typing import Any
 from visualize import visualize_predictions
-
 # defined by author
 import data_handling as data_handling
 
 toolbox: base.Toolbox  # type: ignore
 creator.FitnessMax: Any  # type: ignore
 creator.Individual: Any  # type: ignore
-
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+RUN_NAME="exp_color-fast-test"
+RUN_MODE = "fast"  # "fast", "middle", "normal"
 randomSeeds = 12
 
 dataSetName = 'weizmann_horse'
 image_dir = "data/weizmann_horse/horse"
 mask_dir = "data/weizmann_horse/mask"
 dataset = WeizmannHorseDataset(image_dir, mask_dir)
+RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
 
 def pad_collate(batch):
     """
@@ -58,7 +56,7 @@ def pad_collate(batch):
         pad_masks.append(F.pad(ms, pad, value=0.0))
     return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
-RUN_MODE = "middle"  # "fast", "middle", "normal"
+
 
 # Presets per mode
 _PRESETS = {
@@ -344,6 +342,8 @@ def evalTest(toolbox, individual, test_loader):
 
 
 if __name__ == "__main__":
+    os.environ["RUN_NAME"] = RUN_NAME
+    os.environ["RUN_OUTDIR"] = RUN_OUTDIR
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--run-name", type=str, default=None)
