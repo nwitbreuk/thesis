@@ -1,3 +1,4 @@
+import os
 import pickle
 
 from deap import gp
@@ -46,13 +47,14 @@ def bestInd(toolbox, population, number):
     return bestInd
         
 
-def saveAllResults(randomSeeds, dataSetName, hof, trainTime, testResults, log):
-    fileName1 = str(randomSeeds) + 'Results_on' + dataSetName + '.txt'
+def saveAllResults(randomSeeds, dataSetName, hof, trainTime, testResults, log, outdir="/dataB1/niels_witbreuk/logs/results"):
+    os.makedirs(outdir, exist_ok=True)  # Ensure the directory exists
+
+    fileName1 = os.path.join(outdir, f"{randomSeeds}Results_on{dataSetName}.txt")
     saveLog(fileName1, log)
-    fileName = str(randomSeeds) + 'Final_Result_son' + dataSetName + '.txt'
+    fileName = os.path.join(outdir, f"{randomSeeds}Final_Result_son{dataSetName}.txt")
     saveResults(fileName, 'randomSeed', randomSeeds, 'trainTime', trainTime,
                          'trainResults', hof[0].fitness,
                          'testResults', testResults, 'bestInd in training',
                          hof[0])
-
     return

@@ -1,19 +1,28 @@
 import torch
 import torch.nn.functional as F   # <-- this defines F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'   # <-- this defines device
-import sift_features
-import numpy
-from scipy import ndimage
-from skimage.filters import gabor
-import skimage
-from skimage.feature import local_binary_pattern
-from skimage.feature import hog
-import numpy as np
-from sklearn.svm import LinearSVC
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn import preprocessing
-from sklearn.model_selection import StratifiedKFold
-from sklearn.linear_model import LogisticRegression
+from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
+import torch.nn as nn
+
+
+# Helpers
+def _as_nchw(x: torch.Tensor) -> torch.Tensor:
+    # Accept (H,W), (C,H,W) or (B,C,H,W); return (B,C,H,W)
+    if x.dim() == 2:
+        x = x.unsqueeze(0).unsqueeze(0)         # (1,1,H,W)
+    elif x.dim() == 3:
+        x = x.unsqueeze(0)                       # (1,C,H,W)
+    elif x.dim() != 4:
+        raise ValueError(f"Expected 2D/3D/4D, got shape {tuple(x.shape)}")
+    return x
+
+def _restore_like(y: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    # Return to 2D/3D if input was 2D/3D
+    if like.dim() == 2:      # (H,W)
+        return y.squeeze(0).squeeze(0)
+    if like.dim() == 3:      # (C,H,W)
+        return y.squeeze(0)
+    return y   
 
 # region ==== Combination Functions ====
 
@@ -44,22 +53,17 @@ def if_then_else(cond, a, b):
     return cond * a + (1.0 - cond) * b
 
 def gaussian_blur_param(x, sigma: float):
-    """
-    Apply Gaussian blur to a tensor with a specified sigma.
-    Args:
-        x: Input tensor of shape (B, C, H, W).
-        sigma: Standard deviation for Gaussian kernel.
-    Returns:
-        Blurred tensor.
-    """
-    # sigma in [0.5, 3]; auto kernel size
-    sigma = float(max(0.5, min(3.0, sigma)))
-    k = int(max(3, 2 * int(3 * sigma) + 1))
+    xin = x
+    x = _as_nchw(x)
+    B, C, H, W = x.shape
+    sigma = float(max(0.5, min(5.0, sigma)))
+    k = max(3, 2 * int(3 * sigma) + 1)
     ax = torch.arange(-k // 2 + 1., k // 2 + 1., device=x.device)
     g1 = torch.exp(-0.5 * (ax / sigma) ** 2)
     g1 = g1 / g1.sum()
-    k2 = torch.outer(g1, g1).unsqueeze(0).unsqueeze(0)
-    return F.conv2d(x, k2, padding=k // 2)
+    k2 = torch.outer(g1, g1).unsqueeze(0).unsqueeze(0).repeat(C, 1, 1, 1)  # (C,1,k,k)
+    y = F.conv2d(x, k2, padding=k // 2, groups=C)
+    return _restore_like(y, xin)
 
 # endregion
 # region ==== Basic Math operators ====
@@ -95,175 +99,82 @@ def xor(x, y): return torch.abs(x - y)
 
 
 # endregion
-# region ==== Feature Extraction Functions ====
-# def conVector(img):
-#     """
-#     Concatenate image arrays into a vector.
-#     Args:
-#         img: Image or list of arrays.
-#     Returns:
-#         Flattened vector.
-#     """
-#     try:
-#         img_vector=numpy.concatenate((img))
-#     except:
-#         img_vector=img
-#     return img_vector
 
-# def histLBP(image, radius, n_points):
-#     """
-#     Compute the histogram of Local Binary Pattern (LBP) features for an image.
-#     Args:
-#         image: Input image.
-#         radius: Radius for LBP.
-#         n_points: Number of points for LBP.
-#     Returns:
-#         LBP histogram.
-#     """
-#     lbp = local_binary_pattern(image, n_points, radius, method='nri_uniform')
-#     n_bins = 59
-#     hist, ax = numpy.histogram(lbp, n_bins, (0, 59))
-#     return hist
+# region ==== NN primitives ====
 
-# def all_lbp(image):
-#     """
-#     Compute LBP histograms for all images in a batch.
-#     Args:
-#         image: Batch of images.
-#     Returns:
-#         Array of LBP histograms.
-#     """
-#     feature = []
-#     for i in range(image.shape[0]):
-#         feature_vector = histLBP(image[i,:,:], radius=1.5, n_points=8)
-#         feature.append(feature_vector)
-#     return numpy.asarray(feature)
 
-# def HoGFeatures(image):
-#     """
-#     Compute Histogram of Oriented Gradients (HoG) features for an image.
-#     Args:
-#         image: Input image.
-#     Returns:
-#         HoG feature image or original image if computation fails.
-#     """
-#     try:
-#         img, realImage = hog(image, orientations=9, pixels_per_cell=(8, 8),
-#                     cells_per_block=(3, 3), block_norm='L2-Hys', visualize=True,
-#                     transform_sqrt=False, feature_vector=True)
-#         return realImage
-#     except:
-#         return image
+# Load and freeze a pre-trained segmentation model (DeepLabV3 with ResNet50 backbone)
+# Pre-trained on COCO; outputs 21 classes, but we'll use class 18 (horse) or adapt for binary
+# Load weights with proper meta (silences deprecated warnings)
+_WEIGHTS = DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1
+_PRETRAINED = deeplabv3_resnet50(weights=_WEIGHTS).to(device).eval()
+for p in _PRETRAINED.parameters():
+    p.requires_grad_(False)
 
-# def hog_features_patches(image, patch_size, moving_size):
-#     """
-#     Compute HoG features for patches in an image.
-#     Args:
-#         image: Input image.
-#         patch_size: Size of each patch.
-#         moving_size: Step size for moving window.
-#     Returns:
-#         Array of HoG features for patches.
-#     """
-#     img = numpy.asarray(image)
-#     width, height = img.shape
-#     w = int(width / moving_size)
-#     h = int(height / moving_size)
-#     patch = []
-#     for i in range(0, w):
-#         for j in range(0, h):
-#             patch.append([moving_size * i, moving_size * j])
-#     hog_features = numpy.zeros((len(patch)))
-#     realImage = HoGFeatures(img)
-#     for i in range(len(patch)):
-#         hog_features[i] = numpy.mean(
-#             realImage[patch[i][0]:(patch[i][0] + patch_size), patch[i][1]:(patch[i][1] + patch_size)])
-#     return hog_features
+_MEAN = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+_STD  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+_CATS = _WEIGHTS.meta.get("categories", [])
+_HORSE_IDX = (_CATS.index("horse") if "horse" in _CATS else 13)  # VOC index for 'horse' fallback
 
-# def global_hog_small(image):
-#     """
-#     Compute HoG features for all images in a batch using small patches.
-#     Args:
-#         image: Batch of images.
-#     Returns:
-#         Array of HoG features.
-#     """
-#     feature = []
-#     for i in range(image.shape[0]):
-#         feature_vector = hog_features_patches(image[i,:,:], 4, 4)
-#         feature.append(feature_vector)
-#     return numpy.asarray(feature)
+@torch.no_grad()
+def pretrained_seg_nn(x: torch.Tensor) -> torch.Tensor:
+    """
+    Accepts (H,W), (1,H,W), (3,H,W) or (B,C,H,W).
+    - If grayscale (C=1), replicate to 3 channels.
+    - Normalize with weights meta.
+    - Returns logits for 'horse' as (same batch shape, 1, H, W).
+    """
+    xin = x
+    x = _as_nchw(x).to(device)          # (B,C,H,W)
+    if x.shape[1] == 1:
+        x = x.repeat(1, 3, 1, 1)
+    elif x.shape[1] > 3:
+        x = x[:, :3]
 
-# def all_sift(image):
-#     """
-#     Compute SIFT features for all images in a batch.
-#     Args:
-#         image: Batch of images.
-#     Returns:
-#         Array of SIFT feature vectors.
-#     """
-#     width, height = image[0, :, :].shape
-#     min_length = numpy.min((width, height))
-#     feature = []
-#     for i in range(image.shape[0]):
-#         img = numpy.asarray(image[i, 0:width, 0:height])
-#         extractor = sift_features.SingleSiftExtractor(min_length)
-#         feaArrSingle = extractor.process_image(img[0:min_length, 0:min_length])
-#         w, h = feaArrSingle.shape
-#         feature_vector = numpy.reshape(feaArrSingle, (h,))
-#         feature.append(feature_vector)
-#     return numpy.asarray(feature)
+    x = (x - _MEAN) / _STD
+    out = _PRETRAINED(x)["out"]         # (B,21,H,W)
+    horse_logits = out[:, _HORSE_IDX:_HORSE_IDX+1]  # (B,1,H,W)
+    return _restore_like(horse_logits, xin)
+
+
+
+
 # endregion
+
+# region ==== Feature Extraction Functions ====
+
+# endregion
+
 # region ==== Filtering & edge detection Functions ====
 
 # Sobel and Laplacian filters
-sobel_x_kernel = torch.tensor([[[-1, 0, 1],
-                                [-2, 0, 2],
-                                [-1, 0, 1]]], dtype=torch.float32, device=device).unsqueeze(0)
-sobel_y_kernel = torch.tensor([[[-1, -2, -1],
-                                [ 0,  0,  0],
-                                [ 1,  2,  1]]], dtype=torch.float32, device=device).unsqueeze(0)
-laplacian_kernel = torch.tensor([[[0, 1, 0],
-                                  [1, -4, 1],
-                                  [0, 1, 0]]], dtype=torch.float32, device=device).unsqueeze(0)
+sobel_x_kernel = torch.tensor([[-1, 0, 1],
+                               [-2, 0, 2],
+                               [-1, 0, 1]], dtype=torch.float32, device=device)
+sobel_y_kernel = torch.tensor([[-1, -2, -1],
+                               [ 0,  0,  0],
+                               [ 1,  2,  1]], dtype=torch.float32, device=device)
+laplacian_kernel = torch.tensor([[0, 1, 0],
+                                 [1,-4, 1],
+                                 [0, 1, 0]], dtype=torch.float32, device=device)
 
-def conv2d(x, kernel):
-    return F.conv2d(x, kernel, padding=1)
+def _depthwise_conv(x: torch.Tensor, k2d: torch.Tensor, pad: int) -> torch.Tensor:
+    xin = x
+    x = _as_nchw(x)
+    B, C, H, W = x.shape
+    k = k2d.to(x.device)
+    if k.dim() == 2:
+        k = k.unsqueeze(0).unsqueeze(0)        # (1,1,kh,kw)
+    weight = k.repeat(C, 1, 1, 1)              # (C,1,kh,kw)
+    y = F.conv2d(x, weight, padding=pad, groups=C)
+    return _restore_like(y, xin)
 
-def sobel_x(x): return conv2d(x, sobel_x_kernel)
-def sobel_y(x): return conv2d(x, sobel_y_kernel)
-def laplacian(x): return conv2d(x, laplacian_kernel)
+def sobel_x(x):   return _depthwise_conv(x, sobel_x_kernel, pad=1)
+def sobel_y(x):   return _depthwise_conv(x, sobel_y_kernel, pad=1)
+def laplacian(x): return _depthwise_conv(x, laplacian_kernel, pad=1)
 
 def gradient_magnitude(x):
     gx, gy = sobel_x(x), sobel_y(x)
-    return torch.sqrt(gx ** 2 + gy ** 2)
-
-def erode(x, k=3):
-    return -F.max_pool2d(-x, kernel_size=k, stride=1, padding=k//2)
-
-def dilate(x, k=3):
-    return F.max_pool2d(x, kernel_size=k, stride=1, padding=k//2)
-
-def open_f(x, k=3):
-    return dilate(erode(x, k), k)
-
-def close_f(x, k=3):
-    return erode(dilate(x, k), k)
+    return torch.sqrt(gx * gx + gy * gy + 1e-12)
 
 
-def gaussian_blur(x, k=5, sigma=1.0):
-    def get_gaussian_kernel(k, sigma):
-        ax = torch.arange(-k // 2 + 1., k // 2 + 1.)
-        kernel = torch.exp(-0.5 * (ax / sigma) ** 2)
-        kernel = kernel / kernel.sum()
-        return kernel
-    gk = get_gaussian_kernel(k, sigma).to(device)
-    kernel2d = torch.outer(gk, gk).unsqueeze(0).unsqueeze(0)
-    return F.conv2d(x, kernel2d, padding=k//2)
-
-def mean_filter(x, k=3):
-    kernel = torch.ones((1, 1, k, k), device=device) / (k * k)
-    return F.conv2d(x, kernel, padding=k//2)
-
-
-# endregion

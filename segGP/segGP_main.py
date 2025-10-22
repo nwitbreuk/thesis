@@ -119,14 +119,15 @@ pset.addPrimitive(felgp_fs.sobel_x, [torch.Tensor], torch.Tensor, name="SobelX")
 pset.addPrimitive(felgp_fs.sobel_y, [torch.Tensor], torch.Tensor, name="SobelY")
 pset.addPrimitive(felgp_fs.laplacian, [torch.Tensor], torch.Tensor, name="Laplacian")
 pset.addPrimitive(felgp_fs.gradient_magnitude, [torch.Tensor], torch.Tensor, name="GradientMagnitude")
-pset.addPrimitive(felgp_fs.erode, [torch.Tensor], torch.Tensor, name="Erode")
-pset.addPrimitive(felgp_fs.dilate, [torch.Tensor], torch.Tensor, name="Dilate")
 
+
+# Morphological and other image processing functions
 pset.addPrimitive(felgp_fs.mix, [torch.Tensor, torch.Tensor, float], torch.Tensor, name="Mix")
 pset.addPrimitive(felgp_fs.if_then_else, [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, name="IfElse")
-pset.addPrimitive(felgp_fs.open_f, [torch.Tensor], torch.Tensor, name="Open")
-pset.addPrimitive(felgp_fs.close_f, [torch.Tensor], torch.Tensor, name="Close")
 pset.addPrimitive(felgp_fs.gaussian_blur_param, [torch.Tensor, float], torch.Tensor, name="Gauss")
+
+# Pretrained segmentation NN
+pset.addPrimitive(felgp_fs.pretrained_seg_nn, [torch.Tensor], torch.Tensor, name="PretrainedSeg")
 
 
 #Terminals
@@ -157,6 +158,9 @@ def _binarize_from_logits(logits):
     if not logits.dtype.is_floating_point:
         logits = logits.float()
     logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+    # Reduce to single channel if multi-channel
+    if logits.dim() == 4 and logits.shape[1] > 1:
+        logits = logits.mean(dim=1, keepdim=True)
     probs = torch.sigmoid(logits)
     preds = (probs > 0.5).float()
     return preds, probs
@@ -300,7 +304,7 @@ if __name__ == "__main__":
     saveFile.saveAllResults(randomSeeds, dataSetName, hof, trainTime, testResults, log)
 
     # Optional: visualize predictions from the best individual
-    visualize_predictions(toolbox, hof[0], test_dataset, num_samples=3, threshold=0.5, save_dir="outputs/vis")
+    visualize_predictions(toolbox, hof[0], test_dataset, num_samples=3, threshold=0.5, save_dir="/dataB1/niels_witbreuk/logs/visualizations")
 
     testTime = time.process_time() - endTime
     print('testResults ', testResults)
