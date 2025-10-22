@@ -55,7 +55,7 @@ def pad_collate(batch):
         pad_masks.append(F.pad(ms, pad, value=0.0))
     return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
-FAST_MODE = False  # set False for full run
+FAST_MODE = True  # set False for full run
 
 # parameters (shrink for fast iteration)
 pop_size   = 10 if FAST_MODE else 50
