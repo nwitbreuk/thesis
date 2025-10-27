@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F   # <-- this defines F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'   # <-- this defines device
 from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
+from typing import List
 import torch.nn as nn
 
 
@@ -77,10 +78,23 @@ def sqrt_f(x): return torch.sqrt(torch.clamp(x, min=0))
 def log_f(x): return torch.log1p(torch.abs(x))
 def exp_f(x): return torch.exp(torch.clamp(x, max=10))
 
+def _restore_shape(y: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    # Return to 2D/3D if input was 2D/3D
+    if like.dim() == 2:      # (H,W)
+        return y.squeeze(0).squeeze(0)
+    if like.dim() == 3:      # (C,H,W)
+        return y.squeeze(0)
+    return y
+
 # normalization and activation functions
-def normalize(x):
-    x_min, x_max = x.min(), x.max()
-    return (x - x_min) / (x_max - x_min + 1e-6)
+def normalize(x: torch.Tensor) -> torch.Tensor:
+    xin = x
+    x = _as_nchw(x)
+    B, C, H, W = x.shape
+    mean = x.view(B, C, -1).mean(dim=2).view(B, C, 1, 1)
+    std = x.view(B, C, -1).std(dim=2).view(B, C, 1, 1) + 1e-6
+    y = (x - mean) / std
+    return _restore_shape(y, xin)
 
 def sigmoid(x): return torch.sigmoid(x)
 def tanh_f(x): return torch.tanh(x)
@@ -106,6 +120,108 @@ def xor(x, y): return torch.abs(x - y)
 # Load and freeze a pre-trained segmentation model (DeepLabV3 with ResNet50 backbone)
 # Pre-trained on COCO; outputs 21 classes, but we'll use class 18 (horse) or adapt for binary
 # Load weights with proper meta (silences deprecated warnings)
+
+
+def conv3x3(in_channels, out_channels, stride=1, bias=False):
+    """3x3 convolution with padding="""
+    return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=bias)
+
+def conv_block(in_channels, out_channels, kernel_size=3, stride=1, norm=True, activation=True):
+    """Simple conv -> (BN) -> (ReLU) block. Returns an nn.Sequential module."""
+    layers: List[nn.Module] = [nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=kernel_size//2, bias=not norm)]
+    if norm:
+        layers.append(nn.BatchNorm2d(out_channels))
+    if activation:
+        layers.append(nn.ReLU(inplace=True))
+    return nn.Sequential(*layers)
+
+def depthwise_separable_conv(in_channels, out_channels, kernel_size=3, stride=1):
+    """Depthwise separable conv: depthwise (groups=in_channels) then pointwise.
+
+    This is a lightweight alternative to a full conv and useful for small custom networks.
+    """
+    padding = kernel_size // 2
+    return nn.Sequential(
+        nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=in_channels, bias=False),
+        nn.BatchNorm2d(in_channels),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True),
+    )
+
+class ASPP(nn.Module):
+    """Lightweight Atrous Spatial Pyramid Pooling (ASPP)-like module.
+
+    Usage: aspp = ASPP(in_channels, out_channels); y = aspp(x)
+    """
+    def __init__(self, in_channels, out_channels, rates=(1, 6, 12, 18)):
+        super().__init__()
+        self.rate_convs = nn.ModuleList()
+        for r in rates:
+            if r == 1:
+                # 1x1 conv
+                self.rate_convs.append(nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True),
+                ))
+            else:
+                self.rate_convs.append(nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=r, dilation=r, bias=False),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True),
+                ))
+
+        # global pooling branch
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        self.project = nn.Sequential(
+            nn.Conv2d((len(rates) + 1) * out_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = []
+        for conv in self.rate_convs:
+            res.append(conv(x))
+        gp = self.global_pool(x)
+        gp = F.interpolate(gp, size=res[0].shape[2:], mode='bilinear', align_corners=False)
+        res.append(gp)
+        cat = torch.cat(res, dim=1)
+        return self.project(cat)
+
+def simple_mlp(input_dim, hidden_dims, output_dim, activation=nn.ReLU):
+    """Return a simple MLP (nn.Sequential) with given hidden dims.
+
+    Example: simple_mlp(512, [256,128], 10)
+    """
+    layers = []
+    last = input_dim
+    for h in hidden_dims:
+        layers.append(nn.Linear(last, h))
+        layers.append(activation())
+        last = h
+    layers.append(nn.Linear(last, output_dim))
+    return nn.Sequential(*layers)
+
+def simple_fcn(in_channels, num_classes):
+    """A 1x1 classifier conv producing raw logits for segmentation classes."""
+    return nn.Conv2d(in_channels, num_classes, kernel_size=1)
+
+def parameter_count(model: nn.Module):
+    """Return (total_params, trainable_params) as integers for the given model."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return int(total), int(trainable)
+
+
 _WEIGHTS = DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1
 _PRETRAINED = deeplabv3_resnet50(weights=_WEIGHTS).to(device).eval()
 for p in _PRETRAINED.parameters():
@@ -142,6 +258,7 @@ def pretrained_seg_nn(x: torch.Tensor) -> torch.Tensor:
 # endregion
 
 # region ==== Feature Extraction Functions ====
+
 
 # endregion
 
