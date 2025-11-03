@@ -7,9 +7,32 @@ import subprocess
 import sys
 import time
 import pygraphviz as pgv
+import torch.nn.functional as F
 
 
 from deap import gp
+import torch
+
+def pad_collate(batch):
+    """
+    Collate function to pad images and masks in a batch to the same size.
+        Args:
+    batch: List of tuples (image, mask).
+        Returns:
+    Padded images and masks as tensors.
+    """
+    # batch: List[Tuple[tensor(C,H,W), tensor(C,H,W)]]
+    imgs, masks = zip(*batch)
+    max_h = max(t.shape[1] for t in imgs)
+    max_w = max(t.shape[2] for t in imgs)
+    pad_imgs, pad_masks = [], []
+    for im, ms in zip(imgs, masks):
+        dh = max_h - im.shape[1]
+        dw = max_w - im.shape[2]
+        pad = (0, dw, 0, dh)  # (left, right, top, bottom)
+        pad_imgs.append(F.pad(im, pad, value=0.0))
+        pad_masks.append(F.pad(ms, pad, value=0.0))
+    return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
 def _make_run_dir(args, dataset_name, seed):
     timestamp = time.strftime("%Y%m%d-%H%M%S")
