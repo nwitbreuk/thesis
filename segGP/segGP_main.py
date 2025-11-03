@@ -5,7 +5,6 @@ import traceback
 import torch
 from torch.utils.data import random_split, DataLoader
 import os
-import torch.nn.functional as F
 import numpy as np
 import time
 import multiprocessing
@@ -15,10 +14,13 @@ import algo_iegp as evalGP
 import numpy as np
 from deap import base, creator, tools, gp
 import seggp_functions as felgp_fs
+import seg_types
 from typing import Any
 from visualize import visualize_predictions
-# defined by author
+from data_handling import pad_collate
 import data_handling as data_handling
+
+# region ==== GP Setup ====
 
 toolbox: base.Toolbox  # type: ignore
 creator.FitnessMax: Any  # type: ignore
@@ -31,34 +33,10 @@ mask_dir = "data/weizmann_horse/mask"
 dataset = WeizmannHorseDataset(image_dir, mask_dir)
 RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
 
-RUN_MODE = "fast"  # "fast", "middle", "normal"
+RUN_MODE = "normal"  # "fast", "middle", "normal"
 randomSeeds = 12
-RUN_NAME=f"{dataSetName}_{RUN_MODE}mode_seed{randomSeeds}_{{jid}}_structure-test"
+RUN_NAME=f"{dataSetName}_{RUN_MODE}mode_seed{randomSeeds}_{{jid}}_Constraints-test"
 # _make_run_dir will replace {jid} with SLURM_JOB_ID (or process id if not running under SLURM)
-
-
-def pad_collate(batch):
-    """
-    Collate function to pad images and masks in a batch to the same size.
-        Args:
-    batch: List of tuples (image, mask).
-        Returns:
-    Padded images and masks as tensors.
-    """
-    # batch: List[Tuple[tensor(C,H,W), tensor(C,H,W)]]
-    imgs, masks = zip(*batch)
-    max_h = max(t.shape[1] for t in imgs)
-    max_w = max(t.shape[2] for t in imgs)
-    pad_imgs, pad_masks = [], []
-    for im, ms in zip(imgs, masks):
-        dh = max_h - im.shape[1]
-        dw = max_w - im.shape[2]
-        pad = (0, dw, 0, dh)  # (left, right, top, bottom)
-        pad_imgs.append(F.pad(im, pad, value=0.0))
-        pad_masks.append(F.pad(ms, pad, value=0.0))
-    return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
-
-
 
 # Presets per mode
 _PRESETS = {
@@ -82,9 +60,6 @@ maxDepth = preset["maxDepth"]
 _MODE_BATCH_SIZE = preset["batch_size"]
 _MODE_CAP_TRAIN = preset["cap_train"]
 _MODE_CAP_TEST = preset["cap_test"]
-
-
-
 
 # Split and optionally cap train/test sizes
 full_train_size = int(0.8 * len(dataset))
@@ -130,39 +105,54 @@ params = {
         "test_batch_size": test_loader.batch_size
     }
 
-##GP
-pset = gp.PrimitiveSetTyped('MAIN', [torch.Tensor], torch.Tensor, prefix='Image')
+# endregion ==== GP Setup ====
 
-# Add arithmetic
-pset.addPrimitive(felgp_fs.add, [torch.Tensor, torch.Tensor], torch.Tensor, name="Add")
-pset.addPrimitive(felgp_fs.sub, [torch.Tensor, torch.Tensor], torch.Tensor, name="Sub")
-pset.addPrimitive(felgp_fs.mul, [torch.Tensor, torch.Tensor], torch.Tensor, name="Mul")
-pset.addPrimitive(felgp_fs.safe_div, [torch.Tensor, torch.Tensor], torch.Tensor, name="SafeDiv")
+##GP
+pset = gp.PrimitiveSetTyped('MAIN', [seg_types.RGBImage], seg_types.Mask, prefix='Image')
+
+# Add Basic Math Operators
+# Math operators operate on intermediate feature maps
+pset.addPrimitive(felgp_fs.add, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Add")
+pset.addPrimitive(felgp_fs.sub, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Sub")
+pset.addPrimitive(felgp_fs.mul, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Mul")
+pset.addPrimitive(felgp_fs.safe_div, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="SafeDiv")
+#pset.addPrimitive(felgp_fs.abs_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Abs")
+#pset.addPrimitive(felgp_fs.sqrt_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Sqrt")
+#pset.addPrimitive(felgp_fs.log_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Log")
+#pset.addPrimitive(felgp_fs.exp_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Exp")
+#pset.addPrimitive(felgp_fs.sigmoid, [seg_types.FeatureMap], seg_types.FeatureMap, name="Sigmoid")
+#pset.addPrimitive(felgp_fs.tanh_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="tanh")
+
+# Add logical operators
+pset.addPrimitive(felgp_fs.logical_not, [seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalNot")
+pset.addPrimitive(felgp_fs.logical_or, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalOr")
+pset.addPrimitive(felgp_fs.logical_and, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalAnd")
+pset.addPrimitive(felgp_fs.logical_xor, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalXor")
 
 # Add comparison and normalization
-pset.addPrimitive(felgp_fs.gt, [torch.Tensor, float], torch.Tensor, name="Gt")
-pset.addPrimitive(felgp_fs.lt, [torch.Tensor, float], torch.Tensor, name="Lt")
-pset.addPrimitive(felgp_fs.normalize, [torch.Tensor], torch.Tensor, name="Normalize")
+pset.addPrimitive(felgp_fs.gt, [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Gt")
+pset.addPrimitive(felgp_fs.lt, [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Lt")
+pset.addPrimitive(felgp_fs.normalize, [seg_types.FeatureMap], seg_types.FeatureMap, name="Normalize")
 
-#Feature Extraction
-#pset.addPrimitive(felgp_fs.global_hog_small, [Array1], Array3, name = 'F_HOG')
-#pset.addPrimitive(felgp_fs.all_lbp, [Array1], Array3, name = 'F_uLBP')
-#pset.addPrimitive(felgp_fs.all_sift, [Array1], Array3, name = 'F_SIFT')
+# Add filters and edge detection functions
+pset.addPrimitive(felgp_fs.sobel_x, [seg_types.RGBImage], seg_types.FeatureMap, name="SobelX")
+pset.addPrimitive(felgp_fs.sobel_y, [seg_types.RGBImage], seg_types.FeatureMap, name="SobelY")
+pset.addPrimitive(felgp_fs.laplacian, [seg_types.RGBImage], seg_types.FeatureMap, name="Laplacian")
+pset.addPrimitive(felgp_fs.gradient_magnitude, [seg_types.RGBImage], seg_types.FeatureMap, name="GradientMagnitude")
 
-# Add filters and logicals
-pset.addPrimitive(felgp_fs.sobel_x, [torch.Tensor], torch.Tensor, name="SobelX")
-pset.addPrimitive(felgp_fs.sobel_y, [torch.Tensor], torch.Tensor, name="SobelY")
-pset.addPrimitive(felgp_fs.laplacian, [torch.Tensor], torch.Tensor, name="Laplacian")
-pset.addPrimitive(felgp_fs.gradient_magnitude, [torch.Tensor], torch.Tensor, name="GradientMagnitude")
-
-
-# Morphological and other image processing functions
-pset.addPrimitive(felgp_fs.mix, [torch.Tensor, torch.Tensor, float], torch.Tensor, name="Mix")
-pset.addPrimitive(felgp_fs.if_then_else, [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, name="IfElse")
-pset.addPrimitive(felgp_fs.gaussian_blur_param, [torch.Tensor, float], torch.Tensor, name="Gauss")
+# Combination functions
+pset.addPrimitive(felgp_fs.mix, [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="Mix")
+pset.addPrimitive(felgp_fs.if_then_else, [seg_types.FeatureMap, seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="IfElse")
+pset.addPrimitive(felgp_fs.gaussian_blur_param, [seg_types.RGBImage, float], seg_types.FeatureMap, name="Gauss")
 
 # Pretrained segmentation NN
-pset.addPrimitive(felgp_fs.pretrained_seg_nn, [torch.Tensor], torch.Tensor, name="PretrainedSeg")
+pset.addPrimitive(felgp_fs.pretrained_seg_nn, [seg_types.RGBImage], seg_types.FeatureMap, name="PretrainedSeg")
+# high-level typed NN-like primitives
+pset.addPrimitive(felgp_fs.apply_depthwise_edge, [seg_types.RGBImage, float], seg_types.FeatureMap, name="EdgeFilter")
+pset.addPrimitive(felgp_fs.image_to_featuremap, [seg_types.RGBImage, float], seg_types.FeatureMap, name="ImageToFeat")
+pset.addPrimitive(felgp_fs.apply_aspp_cached, [seg_types.FeatureMap, float], seg_types.FeatureMap, name="ASPPCached")
+pset.addPrimitive(felgp_fs.apply_feature_to_mask_cached, [seg_types.FeatureMap, float], seg_types.Mask, name="FeatToMask")
+
 
 
 #Terminals
@@ -170,6 +160,9 @@ pset.addPrimitive(felgp_fs.pretrained_seg_nn, [torch.Tensor], torch.Tensor, name
 def rand_thresh():
     return float(np.random.uniform(0.05, 0.95))
 pset.addEphemeralConstant('Thresh', rand_thresh, float)
+def rand_channel():
+    return float(np.random.choice([8,16,32,64,128]))
+pset.addEphemeralConstant('Ch', rand_channel, float)
 def rand_alpha(): return float(np.random.uniform(0.0, 1.0))
 pset.addEphemeralConstant('Alpha', rand_alpha, float)
 
