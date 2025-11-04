@@ -161,7 +161,7 @@ def bestInd(toolbox, population, number):
         
 
 
-def saveAllResults(params, hof, trainTime, testResults, log, outdir="/dataB1/niels_witbreuk/logs/results", meta=None, args=None, randomSeeds=None):
+def saveAllResults(params, hof, trainTime, testResults, log, outdir="/dataB1/niels_witbreuk/logs/myruns", meta=None, args=None, randomSeeds=None):
     os.makedirs(outdir, exist_ok=True)
 
     summary_path = os.path.join(outdir, f"Summary_on{params['Dataset']}.txt")
