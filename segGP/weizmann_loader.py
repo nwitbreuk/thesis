@@ -28,11 +28,12 @@ except Exception:
 
 
 class WeizmannHorseDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, size=None, extensions=(".png", ".jpg", ".jpeg")):
+    def __init__(self, image_dir, mask_dir, size=None, extensions=(".png", ".jpg", ".jpeg"), color_mode: str = "rgb"):
         self.img_dir = image_dir
         self.mask_dir = mask_dir
         self.extensions = tuple(e.lower() for e in extensions)
         self.size = size
+        self.color_mode = (color_mode or "rgb").lower()
 
         print(f"Loading images from: {self.img_dir}")
         print(f"Loading masks from: {self.mask_dir}")
@@ -56,7 +57,12 @@ class WeizmannHorseDataset(Dataset):
 
     def __getitem__(self, idx):
         fname = self.filenames[idx]
-        img = Image.open(os.path.join(self.img_dir, fname)).convert("L")
+        # Load image according to color mode
+        if self.color_mode == "rgb":
+            img = Image.open(os.path.join(self.img_dir, fname)).convert("RGB")
+        else:
+            img = Image.open(os.path.join(self.img_dir, fname)).convert("L")
+        # Masks remain single-channel (grayscale)
         msk = Image.open(os.path.join(self.mask_dir, fname)).convert("L")
 
         if self.size is not None:
@@ -71,6 +77,12 @@ class WeizmannHorseDataset(Dataset):
         if mask_np.max() == 0 and idx < 3:
             print(f"[WARN] Empty mask after load/resize for {fname}")
 
-        img_t  = torch.from_numpy(img_np).unsqueeze(0)
+        # Convert to CHW tensor
+        if self.color_mode == "rgb":
+            # (H,W,3) -> (3,H,W)
+            img_t  = torch.from_numpy(img_np).permute(2, 0, 1)
+        else:
+            # (H,W) -> (1,H,W)
+            img_t  = torch.from_numpy(img_np).unsqueeze(0)
         mask_t = torch.from_numpy(mask_np).unsqueeze(0)
         return img_t, mask_t

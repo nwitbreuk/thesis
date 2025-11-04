@@ -27,15 +27,23 @@ creator.FitnessMax: Any  # type: ignore
 creator.Individual: Any  # type: ignore
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-dataSetName = 'weizmann_horse'
-image_dir = "data/weizmann_horse/horse"
-mask_dir = "data/weizmann_horse/mask"
-dataset = WeizmannHorseDataset(image_dir, mask_dir)
+# Early parse/env for color mode so dataset and GP can be configured before build
+_DEFAULT_COLOR = os.environ.get("COLOR_MODE", "gray").lower() # change the default color mode here: "rgb" or "gray"
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--color", choices=["rgb", "gray"], default=_DEFAULT_COLOR,
+                 help="Input color mode: rgb (3-channel) or gray (single-channel)")
+_args_pre, _ = _pre.parse_known_args()
+COLOR_MODE = _args_pre.color
+
+dataSetName = 'Pascal_VOC'
+image_dir = "data/PASCAL_VOC/VOC2012/images/train"
+mask_dir = "data/pascal_voc/masks"
+dataset = WeizmannHorseDataset(image_dir, mask_dir, color_mode=COLOR_MODE)
 RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
 
 RUN_MODE = "normal"  # "fast", "middle", "normal"
-randomSeeds = 12
-RUN_NAME=f"{dataSetName}_{RUN_MODE}mode_seed{randomSeeds}_{{jid}}_Constraints-test"
+randomSeeds = 10
+RUN_NAME=f"{dataSetName}_{RUN_MODE}mode_seed{randomSeeds}_{{jid}}_-{COLOR_MODE}"
 # _make_run_dir will replace {jid} with SLURM_JOB_ID (or process id if not running under SLURM)
 
 # Presets per mode
@@ -102,13 +110,16 @@ params = {
         "initialMaxDepth": initialMaxDepth,
         "maxDepth": maxDepth,
         "train_batch_size": train_loader.batch_size,
-        "test_batch_size": test_loader.batch_size
+        "test_batch_size": test_loader.batch_size,
+        "color_mode": COLOR_MODE,
     }
 
 # endregion ==== GP Setup ====
 
 ##GP
-pset = gp.PrimitiveSetTyped('MAIN', [seg_types.RGBImage], seg_types.Mask, prefix='Image')
+# Select input type based on color mode
+_INPUT_TYPE = seg_types.RGBImage if COLOR_MODE == "rgb" else seg_types.GrayImage
+pset = gp.PrimitiveSetTyped('MAIN', [_INPUT_TYPE], seg_types.Mask, prefix='Image')
 
 # Add Basic Math Operators
 # Math operators operate on intermediate feature maps
@@ -116,12 +127,12 @@ pset.addPrimitive(felgp_fs.add, [seg_types.FeatureMap, seg_types.FeatureMap], se
 pset.addPrimitive(felgp_fs.sub, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Sub")
 pset.addPrimitive(felgp_fs.mul, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Mul")
 pset.addPrimitive(felgp_fs.safe_div, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="SafeDiv")
-#pset.addPrimitive(felgp_fs.abs_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Abs")
-#pset.addPrimitive(felgp_fs.sqrt_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Sqrt")
-#pset.addPrimitive(felgp_fs.log_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Log")
-#pset.addPrimitive(felgp_fs.exp_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Exp")
-#pset.addPrimitive(felgp_fs.sigmoid, [seg_types.FeatureMap], seg_types.FeatureMap, name="Sigmoid")
-#pset.addPrimitive(felgp_fs.tanh_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="tanh")
+pset.addPrimitive(felgp_fs.abs_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Abs")
+pset.addPrimitive(felgp_fs.sqrt_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Sqrt")
+pset.addPrimitive(felgp_fs.log_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Log")
+pset.addPrimitive(felgp_fs.exp_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Exp")
+pset.addPrimitive(felgp_fs.sigmoid, [seg_types.FeatureMap], seg_types.FeatureMap, name="Sigmoid")
+pset.addPrimitive(felgp_fs.tanh_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="tanh")
 
 # Add logical operators
 pset.addPrimitive(felgp_fs.logical_not, [seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalNot")
@@ -134,25 +145,85 @@ pset.addPrimitive(felgp_fs.gt, [seg_types.FeatureMap, float], seg_types.FeatureM
 pset.addPrimitive(felgp_fs.lt, [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Lt")
 pset.addPrimitive(felgp_fs.normalize, [seg_types.FeatureMap], seg_types.FeatureMap, name="Normalize")
 
+# Converters between gray and RGB to allow cross-use of primitives
+pset.addPrimitive(felgp_fs.ensure_rgb, [seg_types.GrayImage], seg_types.RGBImage, name="EnsureRGB")
+pset.addPrimitive(felgp_fs.rgb_to_gray, [seg_types.RGBImage], seg_types.GrayImage, name="RGB2Gray")
+
 # Add filters and edge detection functions
 pset.addPrimitive(felgp_fs.sobel_x, [seg_types.RGBImage], seg_types.FeatureMap, name="SobelX")
 pset.addPrimitive(felgp_fs.sobel_y, [seg_types.RGBImage], seg_types.FeatureMap, name="SobelY")
 pset.addPrimitive(felgp_fs.laplacian, [seg_types.RGBImage], seg_types.FeatureMap, name="Laplacian")
 pset.addPrimitive(felgp_fs.gradient_magnitude, [seg_types.RGBImage], seg_types.FeatureMap, name="GradientMagnitude")
+pset.addPrimitive(felgp_fs.sobel_x, [seg_types.GrayImage], seg_types.FeatureMap, name="SobelX_Gray")
+pset.addPrimitive(felgp_fs.sobel_y, [seg_types.GrayImage], seg_types.FeatureMap, name="SobelY_Gray")
+pset.addPrimitive(felgp_fs.laplacian, [seg_types.GrayImage], seg_types.FeatureMap, name="Laplacian_Gray")
+pset.addPrimitive(felgp_fs.gradient_magnitude, [seg_types.GrayImage], seg_types.FeatureMap, name="GradientMagnitude_Gray")
 
 # Combination functions
 pset.addPrimitive(felgp_fs.mix, [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="Mix")
 pset.addPrimitive(felgp_fs.if_then_else, [seg_types.FeatureMap, seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="IfElse")
 pset.addPrimitive(felgp_fs.gaussian_blur_param, [seg_types.RGBImage, float], seg_types.FeatureMap, name="Gauss")
+pset.addPrimitive(felgp_fs.gaussian_blur_param, [seg_types.GrayImage, float], seg_types.FeatureMap, name="Gauss_Gray")
 
 # Pretrained segmentation NN
 pset.addPrimitive(felgp_fs.pretrained_seg_nn, [seg_types.RGBImage], seg_types.FeatureMap, name="PretrainedSeg")
 # high-level typed NN-like primitives
 pset.addPrimitive(felgp_fs.apply_depthwise_edge, [seg_types.RGBImage, float], seg_types.FeatureMap, name="EdgeFilter")
+pset.addPrimitive(felgp_fs.apply_depthwise_edge, [seg_types.GrayImage, float], seg_types.FeatureMap, name="EdgeFilterGray")
 pset.addPrimitive(felgp_fs.image_to_featuremap, [seg_types.RGBImage, float], seg_types.FeatureMap, name="ImageToFeat")
+pset.addPrimitive(felgp_fs.image_to_featuremap, [seg_types.GrayImage, float], seg_types.FeatureMap, name="ImageToFeatGray")
 pset.addPrimitive(felgp_fs.apply_aspp_cached, [seg_types.FeatureMap, float], seg_types.FeatureMap, name="ASPPCached")
 pset.addPrimitive(felgp_fs.apply_feature_to_mask_cached, [seg_types.FeatureMap, float], seg_types.Mask, name="FeatToMask")
 
+
+# Collect available primitives (name and typed signature) for run info
+def _enumerate_primitives(_pset: gp.PrimitiveSetTyped):
+    prim_list = []
+    try:
+        for _ret, _prims in _pset.primitives.items():
+            for _p in _prims:
+                _args = [getattr(t, '__name__', str(t)) for t in _p.args]
+                _retname = getattr(_p.ret, '__name__', str(_p.ret))
+                prim_list.append(f"{_p.name}({', '.join(_args)}) -> {_retname}")
+    except Exception:
+        # Fallback: at least list names if detailed typing fails
+        try:
+            prim_list = sorted({getattr(p, 'name', str(p)) for v in _pset.primitives.values() for p in v})
+        except Exception:
+            prim_list = []
+    # de-duplicate and sort for readability
+    prim_list = sorted(set(prim_list))
+    return prim_list
+
+AVAILABLE_PRIMITIVES = _enumerate_primitives(pset)
+try:
+    params["available_primitives"] = AVAILABLE_PRIMITIVES
+except Exception:
+    pass
+
+# Enumerate available terminals (including ephemeral constants) for run info
+def _enumerate_terminals(_pset: gp.PrimitiveSetTyped):
+    terms = []
+    try:
+        for _ret, _terms in _pset.terminals.items():
+            for _t in _terms:
+                # gp.Terminal typically has .name and .ret
+                _name = getattr(_t, 'name', str(_t))
+                _retname = getattr(_t.ret, '__name__', str(_t.ret))
+                terms.append(f"{_name} -> {_retname}")
+    except Exception:
+        try:
+            # Fallback to names only
+            terms = sorted({getattr(t, 'name', str(t)) for v in _pset.terminals.values() for t in v})
+        except Exception:
+            terms = []
+    return sorted(set(terms))
+
+AVAILABLE_TERMINALS = _enumerate_terminals(pset)
+try:
+    params["available_terminals"] = AVAILABLE_TERMINALS
+except Exception:
+    pass
 
 
 #Terminals
@@ -347,6 +418,28 @@ if __name__ == "__main__":
     data_handling.saveAllResults(params, hof, trainTime, testResults, log, outdir=run_dir, meta=meta, args=args, randomSeeds=randomSeeds)
     visualize_predictions(toolbox, hof[0], test_dataset, num_samples=3, threshold=0.5,
                           save_dir=os.path.join(run_dir, "visualizations"))
+
+    # Persist primitive/terminal catalogs and best-individual primitive usage for quick inspection
+    try:
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "primitives.txt"), "w") as f:
+            f.write("\n".join(AVAILABLE_PRIMITIVES) + "\n")
+        with open(os.path.join(run_dir, "terminals.txt"), "w") as f:
+            f.write("\n".join(AVAILABLE_TERMINALS) + "\n")
+
+        from collections import Counter
+        usage = Counter()
+        try:
+            for node in hof[0]:
+                if isinstance(node, gp.Primitive):
+                    usage[node.name] += 1
+        except Exception:
+            pass
+        with open(os.path.join(run_dir, "primitive_usage_best.txt"), "w") as f:
+            for name, cnt in sorted(usage.items(), key=lambda x: (-x[1], x[0])):
+                f.write(f"{name} {cnt}\n")
+    except Exception as _e:
+        print(f"[warn] failed to write primitive/terminal catalogs: {_e}")
 
     data_handling._copy_slurm_logs(run_dir, meta)
     print("testResults", testResults)

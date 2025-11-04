@@ -4,6 +4,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'   # <-- this defines dev
 from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
 from typing import List
 from collections import OrderedDict
+import math
 import torch.nn as nn
 
 
@@ -26,33 +27,86 @@ def _restore_like(y: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
         return y.squeeze(0)
     return y   
 
-# region ==== Combination Functions ====
+# region ==== Combination & alignment Helpers ====
+
+def _project_channels_cached(x: torch.Tensor, out_ch: int) -> torch.Tensor:
+    """Project tensor channels to `out_ch` via a cached 1x1 conv (deterministic init, inference-only).
+
+    x: (H,W), (C,H,W) or (B,C,H,W) tensor
+    returns: same batch/spatial shape with C=out_ch
+    """
+    xin = x
+    x = _as_nchw(x)
+    B, C, H, W = x.shape
+    if C == out_ch:
+        return _restore_like(x, xin)
+    key = ("proj1x1", C, out_ch, str(x.device))
+    mod = _module_cache.get(key)
+    if mod is None:
+        mod = nn.Conv2d(C, out_ch, kernel_size=1, bias=False)
+        # deterministic-ish init
+        for p in mod.parameters():
+            if p.dim() > 1:
+                nn.init.kaiming_uniform_(p, a=math.sqrt(5)) if "math" in globals() else nn.init.kaiming_uniform_(p)
+        _module_cache[key] = mod
+        _module_cache.move_to_end(key)
+        if len(_module_cache) > _MAX_CACHE_SIZE:
+            _module_cache.popitem(last=False)
+    mod = mod.to(x.device).to(x.dtype)
+    y = mod(x)
+    return _restore_like(y, xin)
+
+def _repeat_channels(x: torch.Tensor, target_c: int) -> torch.Tensor:
+    xin = x
+    x = _as_nchw(x)
+    B, C, H, W = x.shape
+    if C == target_c:
+        return _restore_like(x, xin)
+    if C == 1:
+        y = x.repeat(1, target_c, 1, 1)
+        return _restore_like(y, xin)
+    # fallback to projection when C>1 and unequal
+    return _project_channels_cached(x, target_c)
+
+def _align_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align two tensors on channel dimension for safe elementwise ops.
+    Rules:
+      - If channels equal: passthrough
+      - If one is single-channel: repeat to the other's channels
+      - Else: project both down to min(Ca, Cb) using cached 1x1 conv
+    """
+    ain, bin = a, b
+    a4 = _as_nchw(a)
+    b4 = _as_nchw(b)
+    Ca = a4.shape[1]
+    Cb = b4.shape[1]
+    if Ca == Cb:
+        return a, b
+    if Ca == 1 and Cb > 1:
+        return _repeat_channels(a, Cb), b
+    if Cb == 1 and Ca > 1:
+        return a, _repeat_channels(b, Ca)
+    # project both to the smaller channel count to reduce cost
+    target = min(Ca, Cb)
+    a_al = _project_channels_cached(a, target)
+    b_al = _project_channels_cached(b, target)
+    return a_al, b_al
 
 def mix(x, y, w: float):
-    """"
-    Mix two tensors with a weight.
-    Args:
-        x: Tensor 1.
-        y: Tensor 2.
-        w: Weight for tensor 1, in [0,1].
-    Returns:
-        Mixed tensor.
-    """
-    # convex combination, w in [0,1]
-    return x * w + y * (1.0 - w)
+    """Convex combination of two tensors with automatic channel alignment."""
+    x_al, y_al = _align_pair(x, y)
+    return x_al * w + y_al * (1.0 - w)
 
 def if_then_else(cond, a, b):
-    """
-    Select between two tensors based on a condition tensor.
-    Args:
-        cond: Condition tensor, expected to be in {0,1}.
-        a: Tensor if condition is true (1).
-        b: Tensor if condition is false (0).
-    Returns:
-        Selected tensor.
-    """
-    # cond expected in {0,1}; broadcast select
-    return cond * a + (1.0 - cond) * b
+    """Select between a and b based on condition tensor, aligning channels as needed."""
+    a_al, b_al = _align_pair(a, b)
+    # cond to 1 channel via mean, then repeat to match target channels
+    cond4 = _as_nchw(cond)
+    Ctarget = _as_nchw(a_al).shape[1]
+    if cond4.shape[1] != 1:
+        cond4 = cond4.mean(dim=1, keepdim=True)
+    cond_al = _repeat_channels(cond4, Ctarget)
+    return cond_al * a_al + (1.0 - cond_al) * b_al
 
 def gaussian_blur_param(x, sigma: float):
     xin = x
@@ -68,12 +122,23 @@ def gaussian_blur_param(x, sigma: float):
     return _restore_like(y, xin)
 
 # endregion
-# region ==== Basic Math operators ====
+# region ==== Basic Math operators (channel-safe) ====
 
-def add(x, y): return x + y
-def sub(x, y): return x - y
-def mul(x, y): return x * y
-def safe_div(x, y): return x / (y + 1e-6)
+def add(x, y):
+    xa, ya = _align_pair(x, y)
+    return xa + ya
+
+def sub(x, y):
+    xa, ya = _align_pair(x, y)
+    return xa - ya
+
+def mul(x, y):
+    xa, ya = _align_pair(x, y)
+    return xa * ya
+
+def safe_div(x, y):
+    xa, ya = _align_pair(x, y)
+    return xa / (ya + 1e-6)
 def abs_f(x): return torch.abs(x)
 def sqrt_f(x): return torch.sqrt(torch.clamp(x, min=0))
 def log_f(x): return torch.log1p(torch.abs(x))
@@ -103,11 +168,21 @@ def normalize(x: torch.Tensor) -> torch.Tensor:
     return _restore_shape(y, xin)
 def clamp01(x): return torch.clamp(x, 0.0, 1.0)
 
-# Logical operators
-def logical_and(x, y): return (x * y)
-def logical_or(x, y): return torch.clamp(x + y, 0, 1)
-def logical_not(x): return 1 - x
-def logical_xor(x, y): return torch.abs(x - y)
+# Logical operators (channel-safe)
+def logical_and(x, y):
+    xa, ya = _align_pair(x, y)
+    return xa * ya
+
+def logical_or(x, y):
+    xa, ya = _align_pair(x, y)
+    return torch.clamp(xa + ya, 0, 1)
+
+def logical_not(x):
+    return 1 - x
+
+def logical_xor(x, y):
+    xa, ya = _align_pair(x, y)
+    return torch.abs(xa - ya)
 
 
 
