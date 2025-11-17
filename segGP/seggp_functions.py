@@ -264,13 +264,19 @@ def apply_aspp_cached(x: torch.Tensor, out_channels_f: float) -> torch.Tensor:
     mod = _module_cache.get(key)
     if mod is None:
         mod = ASPP(C, out_channels, rates=(1,6,12))   # reduce rates for speed
+        # Initialize weights
         for p in mod.parameters():
             if p.dim() > 1:
                 nn.init.kaiming_normal_(p)
+        # Use eval() to avoid BatchNorm complaining about batch-size=1 (GP often runs per-image)
+        mod.eval()
         _module_cache[key] = mod
         _module_cache.move_to_end(key)
         if len(_module_cache) > _MAX_CACHE_SIZE:
             _module_cache.popitem(last=False)
+    else:
+        # Ensure in eval mode even when fetched from cache
+        mod.eval()
     mod = mod.to(x.device).to(x.dtype)
     y = mod(x)
     return _restore_like(y, xin)
@@ -425,7 +431,11 @@ def pretrained_seg_nn(x: torch.Tensor) -> torch.Tensor:
     Accepts (H,W), (1,H,W), (3,H,W) or (B,C,H,W).
     - If grayscale (C=1), replicate to 3 channels.
     - Normalize with weights meta.
-    - Returns logits for 'horse' as (same batch shape, 1, H, W).
+    - Returns feature maps (logits) as (same batch shape, 32, H, W) to be combined downstream.
+
+    Note: Previously returned 21-class logits. To treat the NN as a feature extractor
+    rather than a full segmenter, we reduce the channel dimensionality via a 1x1 conv
+    to a compact feature representation; decoding to classes is left to the GP tree.
     """
     xin = x
     x = _as_nchw(x).to(device)          # (B,C,H,W)
@@ -436,8 +446,19 @@ def pretrained_seg_nn(x: torch.Tensor) -> torch.Tensor:
 
     x = (x - _MEAN) / _STD
     out = _PRETRAINED(x)["out"]         # (B,21,H,W)
-    horse_logits = out[:, _HORSE_IDX:_HORSE_IDX+1]  # (B,1,H,W)
-    return _restore_like(horse_logits, xin)
+    # Project to a compact feature map to discourage direct class output dominance
+    key = ("pre_nn_proj", out.shape[1], 32, str(out.device))
+    mod = _module_cache.get(key)
+    if mod is None:
+        mod = nn.Conv2d(out.shape[1], 32, kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(mod.weight)
+        _module_cache[key] = mod
+        _module_cache.move_to_end(key)
+        if len(_module_cache) > _MAX_CACHE_SIZE:
+            _module_cache.popitem(last=False)
+    mod = mod.to(out.device).to(out.dtype)
+    feats = mod(out)
+    return _restore_like(feats, xin)
 
 # endregion
 
@@ -472,6 +493,25 @@ def laplacian(x): return _depthwise_conv(x, laplacian_kernel, pad=1)
 def gradient_magnitude(x):
     gx, gy = sobel_x(x), sobel_y(x)
     return torch.sqrt(gx * gx + gy * gy + 1e-12)
+# endregion
+
+# region ==== Pretrained feature combinators ====
+
+def combine_pre_feat(pre_feats: torch.Tensor, fmap: torch.Tensor, w: float) -> torch.Tensor:
+    """
+    Combine pretrained features with another feature map using a convex mix after channel alignment.
+
+    Args:
+        pre_feats: tensor-like features produced by pretrained_seg_nn (any shape convertible to NCHW)
+        fmap: tensor-like regular feature map
+        w: mixing coefficient in [0,1]; output = w * A + (1-w) * B
+
+    Returns: Feature map tensor aligned to input spatial dims.
+    """
+    # Reuse existing helpers to align and mix safely
+    # mix(x, y, w) already aligns channels and returns x*w + y*(1-w)
+    return mix(pre_feats, fmap, float(max(0.0, min(1.0, w))))
+
 # endregion
 
 

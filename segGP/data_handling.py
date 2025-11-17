@@ -16,22 +16,33 @@ import torch
 def pad_collate(batch):
     """
     Collate function to pad images and masks in a batch to the same size.
-        Args:
-    batch: List of tuples (image, mask).
-        Returns:
-    Padded images and masks as tensors.
+
+    Args:
+        batch: List of tuples (image, mask) where image is (C,H,W) float in [0,1],
+               and mask is either (1,H,W) float (binary) or (H,W) long (multiclass).
+    Returns:
+        (images, masks): both padded to (B,C,H,W). For multiclass masks, C=1 and dtype is long.
     """
-    # batch: List[Tuple[tensor(C,H,W), tensor(C,H,W)]]
     imgs, masks = zip(*batch)
-    max_h = max(t.shape[1] for t in imgs)
-    max_w = max(t.shape[2] for t in imgs)
+    # target spatial size from images
+    max_h = max(t.shape[-2] for t in imgs)
+    max_w = max(t.shape[-1] for t in imgs)
     pad_imgs, pad_masks = [], []
     for im, ms in zip(imgs, masks):
-        dh = max_h - im.shape[1]
-        dw = max_w - im.shape[2]
+        # ensure channel-first
+        if im.dim() == 2:
+            im = im.unsqueeze(0)
+        # make masks 3D (C,H,W) by adding channel if needed
+        if ms.dim() == 2:
+            ms = ms.unsqueeze(0)
+        # compute padding based on image spatial size
+        dh = max_h - im.shape[-2]
+        dw = max_w - im.shape[-1]
         pad = (0, dw, 0, dh)  # (left, right, top, bottom)
         pad_imgs.append(F.pad(im, pad, value=0.0))
-        pad_masks.append(F.pad(ms, pad, value=0.0))
+        # pad masks with ignore-like value for integer masks, else 0.0 for float masks
+        mask_pad_val = 0.0 if ms.dtype.is_floating_point else 255
+        pad_masks.append(F.pad(ms, pad, value=mask_pad_val))
     return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
 def _make_run_dir(args, dataset_name, seed):
@@ -58,6 +69,43 @@ def _git_info_safe(repo_dir="."):
         branch = os.environ.get("RUN_BRANCH","unknown")
         commit = os.environ.get("RUN_COMMIT","unknown")
     return branch, commit
+
+# Collect available primitives (name and typed signature) for run info
+def _enumerate_primitives(_pset: gp.PrimitiveSetTyped):
+    prim_list = []
+    try:
+        for _ret, _prims in _pset.primitives.items():
+            for _p in _prims:
+                _args = [getattr(t, '__name__', str(t)) for t in _p.args]
+                _retname = getattr(_p.ret, '__name__', str(_p.ret))
+                prim_list.append(f"{_p.name}({', '.join(_args)}) -> {_retname}")
+    except Exception:
+        # Fallback: at least list names if detailed typing fails
+        try:
+            prim_list = sorted({getattr(p, 'name', str(p)) for v in _pset.primitives.values() for p in v})
+        except Exception:
+            prim_list = []
+    # de-duplicate and sort for readability
+    prim_list = sorted(set(prim_list))
+    return prim_list
+
+# Enumerate available terminals (including ephemeral constants) for run info
+def _enumerate_terminals(_pset: gp.PrimitiveSetTyped):
+    terms = []
+    try:
+        for _ret, _terms in _pset.terminals.items():
+            for _t in _terms:
+                # gp.Terminal typically has .name and .ret
+                _name = getattr(_t, 'name', str(_t))
+                _retname = getattr(_t.ret, '__name__', str(_t.ret))
+                terms.append(f"{_name} -> {_retname}")
+    except Exception:
+        try:
+            # Fallback to names only
+            terms = sorted({getattr(t, 'name', str(t)) for v in _pset.terminals.values() for t in v})
+        except Exception:
+            terms = []
+    return sorted(set(terms))
 
 def _write_run_info(run_dir, meta, args, randomSeeds):
     branch, commit = ("unknown","unknown") if args.no_git_check else _git_info_safe(os.getcwd())
@@ -202,6 +250,7 @@ def saveAllResults(params, hof, trainTime, testResults, log, outdir="/dataB1/nie
 
             f.write("=== FINAL RESULTS ===\n")
             f.write(f"Dataset: {params.get('Dataset')}\n")
+            f.write(f"image_dir: {params.get('image_dir')}\n")
             f.write(f"randomSeeds: {params.get('randomSeeds')}\n")
             f.write(f"trainTime: {trainTime}\n")
             f.write(f"trainResults (hof[0].fitness): {getattr(hof[0], 'fitness', None)}\n")

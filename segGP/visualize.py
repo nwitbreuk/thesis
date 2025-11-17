@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from deap import base, gp
-from weizmann_loader import WeizmannHorseDataset
+from data_loader import WeizmannHorseDataset
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'   # <-- this defines device
 
@@ -45,7 +45,7 @@ def _to_imshow(img_t):
     # Fallback for unexpected dims: squeeze and recurse
     return _to_imshow(_np.squeeze(arr))
 
-def visualize_predictions(toolbox, individual, dataset, num_samples=3, threshold=0.5, save_dir=None):
+def visualize_predictions(toolbox, individual, dataset, num_samples=3, threshold=0.5, save_dir=None, num_classes=None):
     """
     Visualize predictions of a GP individual on samples from a dataset.
     """
@@ -59,20 +59,63 @@ def visualize_predictions(toolbox, individual, dataset, num_samples=3, threshold
         img, mask = dataset[idx]  # img: (C,H,W), mask: (1,H,W)
         with torch.no_grad():
             inp = img.unsqueeze(0).to(device)         # (1,C,H,W)
-            out = torch.sigmoid(func(inp))            # (1,1,H,W) expected
-            pred = (out > threshold).float()          # (1,1,H,W)
+            out = func(inp)
+            # Determine whether output is binary or multiclass by channel dim
+            if out.dim() == 4 and out.shape[1] > 1:
+                # multiclass: softmax then argmax
+                probs = torch.softmax(out, dim=1)
+                pred = probs.argmax(dim=1, keepdim=True).float()  # (1,1,H,W) as float for compatibility
+            else:
+                # binary: sigmoid + threshold
+                probs = torch.sigmoid(out)
+                pred = (probs > threshold).float()          # (1,1,H,W)
         # Prepare image for display (robust to CHW/HWC)
         img_np, img_cmap = _to_imshow(img)
-        mask_np = mask.squeeze(0).cpu().numpy()
+        # prepare numpy arrays for display
+        # mask may be (1,H,W) (binary) or (H,W) (multiclass long)
+        if isinstance(mask, torch.Tensor):
+            mask_t = mask.cpu()
+        else:
+            # if dataset returned numpy, convert
+            mask_t = torch.from_numpy(np.asarray(mask))
+
+        if mask_t.dim() == 3 and mask_t.shape[0] == 1:
+            mask_np = mask_t.squeeze(0).numpy()
+        else:
+            mask_np = mask_t.numpy()
+
         pred_np = pred.squeeze(0).squeeze(0).cpu().numpy()
 
+        # Choose display for multiclass vs binary
         fig, axs = plt.subplots(1, 3, figsize=(9, 3))
         axs[0].imshow(img_np, cmap=img_cmap)
         axs[0].set_title("Input")
-        axs[1].imshow(pred_np, cmap='gray')
-        axs[1].set_title("Prediction")
-        axs[2].imshow(mask_np, cmap='gray')
-        axs[2].set_title("Ground Truth")
+
+        # infer num_classes if not provided
+        ncls = None
+        if num_classes is not None:
+            ncls = int(num_classes)
+        elif hasattr(dataset, 'num_classes'):
+            try:
+                ncls = int(getattr(dataset, 'num_classes'))
+            except Exception:
+                ncls = None
+
+        if out is not None and out.dim() == 4 and out.shape[1] > 1:
+            # multiclass display
+            if ncls is None:
+                ncls = int(out.shape[1])
+            cmap = plt.get_cmap('tab20', max(2, ncls))
+            axs[1].imshow(pred_np, cmap=cmap, vmin=0, vmax=max(1, ncls-1))
+            axs[1].set_title("Prediction")
+            axs[2].imshow(mask_np, cmap=cmap, vmin=0, vmax=max(1, ncls-1))
+            axs[2].set_title("Ground Truth")
+        else:
+            # binary display
+            axs[1].imshow(pred_np, cmap='gray')
+            axs[1].set_title("Prediction")
+            axs[2].imshow(mask_np, cmap='gray')
+            axs[2].set_title("Ground Truth")
         for ax in axs: ax.axis('off')
         fig.tight_layout()
 
