@@ -19,6 +19,17 @@ from visualize import visualize_predictions
 from data_handling import _enumerate_primitives, _enumerate_terminals, pad_collate
 import data_handling as data_handling
 from miou_eval import eval_dataset_miou  # dataset-level mIoU (no penalties integrated)
+from algo_iegp import run_pretrained_baseline  # baseline eval without GP
+import sys
+
+
+# User-configurable options
+COLOR_MODE = "rgb"  # "rgb" or "gray"
+DATASET = "voc" # "voc" or "weizmann"
+BASELINE_ONLY = "0" # "0" for no or "1" for yes, run only the pretrained NN and exit
+RUN_MODE = "middle"  # "fast", "middle", "normal"
+randomSeeds = 12
+Run_title_SUFFIX = "test" # Optional suffix for run name
 
 # region ==== GP Setup ====
 
@@ -27,36 +38,25 @@ creator.FitnessMax: Any  # type: ignore
 creator.Individual: Any  # type: ignore
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Early parse/env for color mode so dataset and GP can be configured before build
-_DEFAULT_COLOR = os.environ.get("COLOR_MODE", "rgb").lower() # change the default color mode here: "rgb" or "gray"
-_pre = argparse.ArgumentParser(add_help=False)
-_pre.add_argument("--color", choices=["rgb", "gray"], default=_DEFAULT_COLOR,
-                 help="Input color mode: rgb (3-channel) or gray (single-channel)")
-_pre.add_argument("--num-classes", type=int, default=21,
-                 help="Number of segmentation classes (1 for binary). This is an early setting used to build the GP primitive set.")
-_DEFAULT_DATASET = os.environ.get("DATASET", "voc").lower()
-_pre.add_argument("--dataset", choices=["voc", "weizmann"], default=_DEFAULT_DATASET,
-                 help="Dataset to use: voc (Pascal VOC subset) or weizmann (Weizmann horse)")
-_args_pre, _ = _pre.parse_known_args()
-COLOR_MODE = _args_pre.color
-NUM_CLASSES = int(max(1, _args_pre.num_classes))
-DATASET = _args_pre.dataset
+# Infer number of classes from dataset selection; allow optional override.
+if DATASET == 'voc':
+    inferred_classes = 21
+elif DATASET == 'weizmann':
+    inferred_classes = 1
+else:
+    raise ValueError(f"Unknown dataset option: {DATASET}")
+
+NUM_CLASSES = inferred_classes
+
 
 if DATASET == 'voc':
     dataSetName = 'Pascal_VOC'
-    #image_dir = "data/my_subset/images"
-    #mask_dir = "data/my_subset/masks"
     image_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_train_val/VOC2012_train_val/JPEGImages"
     mask_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_train_val/VOC2012_train_val/SegmentationClass"
-    # default to 21 classes if user didn't intend binary
-    if NUM_CLASSES == 1:
-        NUM_CLASSES = 21
 elif DATASET == 'weizmann':
     dataSetName = 'weizmann_horse'
     image_dir = "data/weizmann_horse/horse"
     mask_dir = "data/weizmann_horse/mask"
-    # Weizmann is binary
-    NUM_CLASSES = 1
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
 
@@ -64,10 +64,16 @@ dataset = GeneralSegDataset(image_dir=image_dir, mask_dir=mask_dir, mode="png", 
 IGNORE_INDEX = getattr(dataset, 'ignore_index', None)
 RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
 
-RUN_MODE = "normal"  # "fast", "middle", "normal"
-randomSeeds = 12
-RUN_NAME=f"{dataSetName}_{RUN_MODE}mode_seed{randomSeeds}_{{jid}}_-{COLOR_MODE}"
-# _make_run_dir will replace {jid} with SLURM_JOB_ID (or process id if not running under SLURM)
+
+
+RUN_NAME = data_handling.make_run_name(
+    dataset_name=dataSetName,
+    run_mode=RUN_MODE,
+    seed=randomSeeds,
+    color_mode=COLOR_MODE,
+    suffix=Run_title_SUFFIX,
+    baseline_only=bool(int(BASELINE_ONLY)) if isinstance(BASELINE_ONLY, str) else bool(BASELINE_ONLY),
+)
 
 # Presets per mode
 _PRESETS = {
@@ -124,6 +130,37 @@ test_loader  = DataLoader(test_dataset, batch_size=_MODE_BATCH_SIZE,
                           shuffle=False, collate_fn=pad_collate,
                           num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
 
+# Optional: run only the pretrained baseline and exit early
+if BASELINE_ONLY:
+    print(f"[Baseline] Evaluating pretrained_seg_nn on dataset '{dataSetName}' (classes={NUM_CLASSES})...")
+    from types import SimpleNamespace
+    args_ns = SimpleNamespace(run_name=RUN_NAME, outdir=RUN_OUTDIR, no_git_check=False)
+    run_dir, meta = data_handling._make_run_dir(args_ns, dataSetName, randomSeeds)
+    data_handling._write_run_info(run_dir, meta, args_ns, randomSeeds)
+    # Perform baseline evaluation and save artifacts into run_dir
+    _ = run_pretrained_baseline(
+        train_loader=train_loader,
+        test_loader=test_loader,
+        num_classes=NUM_CLASSES,
+        device=device,
+        ignore_index=IGNORE_INDEX,
+        run_dir=run_dir,
+        dataset_name=dataSetName,
+        randomSeeds=randomSeeds,
+        params={
+            "Dataset": dataSetName,
+            "RUN_MODE": RUN_MODE,
+            "color_mode": COLOR_MODE,
+            "num_classes": NUM_CLASSES,
+        },
+        args=args_ns,
+        meta=meta,
+        copy_slurm_logs=True,
+        save_visuals=True,
+        vis_count=6,
+    )
+    sys.exit(0)
+
 params = {
         "Dataset": dataSetName,
         "RUN_MODE": RUN_MODE,
@@ -146,7 +183,8 @@ params = {
 
 # endregion ==== GP Setup ====
 
-##GP
+# region ==== GP function and terminal set definitions ====
+
 # Select input type based on color mode and desired output type
 _INPUT_TYPE = seg_types.RGBImage if COLOR_MODE == "rgb" else seg_types.GrayImage
 _OUTPUT_TYPE = seg_types.FeatureMap if NUM_CLASSES > 1 else seg_types.Mask
@@ -254,6 +292,9 @@ toolbox.register("population", tools.initRepeat, list, toolbox.individual) # typ
 toolbox.register("compile", gp.compile, pset=pset)
 toolbox.register("mapp", pool.map)
 
+# endregion ==== GP function and terminal set definitions ====
+
+# region ==== GP helper and evaluation functions ====
 
 def _binarize_from_logits(logits):
     # Robust: handle NaNs/Infs and non-float outputs
@@ -419,6 +460,8 @@ def evalTest(toolbox, individual, test_loader):
     except Exception as e:
         print("Evaluation error (test):", e)
         return 0.0
+    
+    # endregion ==== GP helper and evaluation functions ====
 
 
 if __name__ == "__main__":

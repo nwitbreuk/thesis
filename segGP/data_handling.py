@@ -45,6 +45,26 @@ def pad_collate(batch):
         pad_masks.append(F.pad(ms, pad, value=mask_pad_val))
     return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
 
+def make_run_name(dataset_name: str,
+                  run_mode: str,
+                  seed: int,
+                  color_mode: str,
+                  suffix: str | None = None,
+                  baseline_only: bool = False) -> str:
+    """Construct the RUN_NAME used for output directories.
+
+    Matches the existing format in segGP_main:
+    - base: f"{dataset_name}_{run_mode}mode_seed{seed}_{jid}_{color_mode}-"
+    - when baseline_only=True: append the provided suffix (if any)
+
+    The string contains a literal "{jid}" placeholder that _make_run_dir
+    will replace with SLURM job id or current pid.
+    """
+    base = f"{dataset_name}_{run_mode}mode_seed{seed}_{{jid}}_-{color_mode}-{suffix}"
+    if baseline_only:
+        return f"{base}-NN-only"
+    return base
+
 def _make_run_dir(args, dataset_name, seed):
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     jid = os.environ.get("SLURM_JOB_ID", str(os.getpid()))

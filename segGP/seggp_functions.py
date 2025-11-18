@@ -431,11 +431,13 @@ def pretrained_seg_nn(x: torch.Tensor) -> torch.Tensor:
     Accepts (H,W), (1,H,W), (3,H,W) or (B,C,H,W).
     - If grayscale (C=1), replicate to 3 channels.
     - Normalize with weights meta.
-    - Returns feature maps (logits) as (same batch shape, 32, H, W) to be combined downstream.
-
-    Note: Previously returned 21-class logits. To treat the NN as a feature extractor
-    rather than a full segmenter, we reduce the channel dimensionality via a 1x1 conv
-    to a compact feature representation; decoding to classes is left to the GP tree.
+    - Returns segmentation logits (same batch shape, 21, H, W) directly from the
+      pretrained DeepLabV3 head. This restores the original behavior where the
+      network acts as a full segmenter rather than only a feature extractor.
+    
+    For binary setups (NUM_CLASSES == 1) downstream code may still apply a
+    channel selection or projection; here we always return the full 21-class
+    logits to keep the primitive generic.
     """
     xin = x
     x = _as_nchw(x).to(device)          # (B,C,H,W)
@@ -445,20 +447,8 @@ def pretrained_seg_nn(x: torch.Tensor) -> torch.Tensor:
         x = x[:, :3]
 
     x = (x - _MEAN) / _STD
-    out = _PRETRAINED(x)["out"]         # (B,21,H,W)
-    # Project to a compact feature map to discourage direct class output dominance
-    key = ("pre_nn_proj", out.shape[1], 32, str(out.device))
-    mod = _module_cache.get(key)
-    if mod is None:
-        mod = nn.Conv2d(out.shape[1], 32, kernel_size=1, bias=False)
-        nn.init.kaiming_normal_(mod.weight)
-        _module_cache[key] = mod
-        _module_cache.move_to_end(key)
-        if len(_module_cache) > _MAX_CACHE_SIZE:
-            _module_cache.popitem(last=False)
-    mod = mod.to(out.device).to(out.dtype)
-    feats = mod(out)
-    return _restore_like(feats, xin)
+    out = _PRETRAINED(x)["out"]         # (B,21,H,W) VOC/COCO-aligned logits
+    return _restore_like(out, xin)
 
 # endregion
 
