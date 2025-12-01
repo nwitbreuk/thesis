@@ -2,9 +2,6 @@ import matplotlib.pyplot as plt
 import os
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from deap import base, gp
-from data_loader import WeizmannHorseDataset
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'   # <-- this defines device
 

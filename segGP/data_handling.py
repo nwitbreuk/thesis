@@ -61,6 +61,7 @@ def make_run_name(dataset_name: str,
     will replace with SLURM job id or current pid.
     """
     base = f"{dataset_name}_{run_mode}mode_seed{seed}_{{jid}}_-{color_mode}-{suffix}"
+    
     if baseline_only:
         return f"{base}-NN-only"
     return base

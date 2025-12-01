@@ -197,7 +197,6 @@ def eval_pretrained_on_loader(
     device: Optional[str] = None,
     ignore_index: Optional[int] = 255,
     max_batches: Optional[int] = None,
-    horse_class_idx: Optional[int] = None,
 ) -> Tuple[np.ndarray, float]:
     """Evaluate DeepLabV3 baseline directly on a DataLoader.
 
@@ -209,8 +208,7 @@ def eval_pretrained_on_loader(
       num_classes: number of classes including background (use 21 for VOC).
       device: 'cuda' or 'cpu'. Defaults to CUDA if available.
       ignore_index: label to ignore for multiclass (e.g., 255 for VOC).
-      max_batches: optional limit for quick tests.
-      horse_class_idx: optional override for VOC horse class index. Defaults to internal felgp_fs._HORSE_IDX.
+    max_batches: optional limit for quick tests.
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -222,14 +220,16 @@ def eval_pretrained_on_loader(
         total_sum = 0.0
 
     processed = 0
-    horse_idx = felgp_fs._HORSE_IDX if horse_class_idx is None else int(horse_class_idx)
 
     for imgs, masks in data_loader:
         imgs = imgs.to(device)
         # masks shape: (B,1,H,W); long for multiclass, float for binary
         # Use original dtype for comparisons below
         with torch.no_grad():
-            logits = felgp_fs.pretrained_seg_nn(imgs)  # (B,21,H,W)
+            #if dataset = "aoi"
+            #    logits = felgp_fs.pretrained_seg_nn_aoi(imgs)  # (B,21,H,W)
+            #else:
+                logits = felgp_fs.pretrained_seg_nn(imgs)  # (B,21,H,W)
 
         if num_classes > 1:
             pred_ids = logits.argmax(dim=1)  # (B,H,W)
@@ -244,10 +244,21 @@ def eval_pretrained_on_loader(
             t_np = targ_ids.view(-1).cpu().numpy().astype(np.int64)
             conf = _accumulate_confmat(conf, p_np, t_np, num_classes=num_classes, ignore_index=ignore_index)
         else:
-            # Binary: derive horse mask from argmax; compute dataset-level Dice
-            pred_ids = logits.argmax(dim=1)  # (B,H,W)
-            pred_bin = (pred_ids == horse_idx).to(torch.float32)
-            # target expected (B,1,H,W) float {0,1}
+            # Binary: reduce multi-channel logits to a single-channel score,
+            # apply sigmoid and threshold to obtain binary predictions.
+            # If logits have multiple channels, average them to form a single
+            # foreground score; if single-channel, use it directly.
+            if logits.dim() == 4 and logits.shape[1] > 1:
+                logits_bin = logits.mean(dim=1)  # (B,H,W)
+            elif logits.dim() == 4 and logits.shape[1] == 1:
+                logits_bin = logits.squeeze(1)   # (B,H,W)
+            else:
+                logits_bin = logits
+
+            probs = torch.sigmoid(logits_bin)
+            pred_bin = (probs > 0.5).to(torch.float32)
+
+            # target expected (B,1,H,W) or (B,H,W)
             targ_bin = masks
             if targ_bin.dim() == 4 and targ_bin.shape[1] == 1:
                 targ_bin = targ_bin.squeeze(1)
@@ -280,7 +291,6 @@ def run_pretrained_baseline(
     device: Optional[str] = None,
     ignore_index: Optional[int] = 255,
     max_batches: Optional[int] = None,
-    horse_class_idx: Optional[int] = None,
     # Saving/output integration params
     run_dir: Optional[str] = None,
     dataset_name: Optional[str] = None,
@@ -299,8 +309,8 @@ def run_pretrained_baseline(
     - Saves a few prediction visualizations under `visualizations/`
     - Copies Slurm logs into the run dir if `meta` is provided and `copy_slurm_logs=True`
     """
-    train_scores = eval_pretrained_on_loader(train_loader, num_classes, device, ignore_index, max_batches, horse_class_idx)
-    test_scores  = eval_pretrained_on_loader(test_loader,  num_classes, device, ignore_index, max_batches, horse_class_idx)
+    train_scores = eval_pretrained_on_loader(train_loader, num_classes, device, ignore_index, max_batches)
+    test_scores  = eval_pretrained_on_loader(test_loader,  num_classes, device, ignore_index, max_batches)
 
     train_per, train_mean = train_scores
     test_per,  test_mean  = test_scores
@@ -344,8 +354,14 @@ def run_pretrained_baseline(
                         preds = logits.argmax(dim=1, keepdim=True).float()
                         cmap = plt.get_cmap('tab20', max(2, num_classes))
                     else:
-                        pred_ids = logits.argmax(dim=1, keepdim=True)
-                        preds = (pred_ids == (felgp_fs._HORSE_IDX if horse_class_idx is None else horse_class_idx)).float()
+                        # Binary: collapse multi-channel logits to a single-channel
+                        # score then sigmoid+threshold to obtain binary mask.
+                        if logits.dim() == 4 and logits.shape[1] > 1:
+                            logits_bin = logits.mean(dim=1, keepdim=True)
+                        else:
+                            logits_bin = logits
+                        probs = torch.sigmoid(logits_bin)
+                        preds = (probs > 0.5).float()
                         cmap = 'gray'
 
                     # Loop samples in this batch

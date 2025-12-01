@@ -10,11 +10,12 @@ import multiprocessing
 from generic_seg_loader import GeneralSegDataset
 import gp_restrict as gp_restrict
 import algo_iegp as evalGP
+import torch.nn.functional as F
 import numpy as np
 from deap import base, creator, tools, gp
 import seggp_functions as felgp_fs
 import seg_types
-from typing import Any
+from typing import Any, Callable
 from visualize import visualize_predictions
 from data_handling import _enumerate_primitives, _enumerate_terminals, pad_collate
 import data_handling as data_handling
@@ -25,11 +26,31 @@ import sys
 
 # User-configurable options
 COLOR_MODE = "rgb"  # "rgb" or "gray"
-DATASET = "voc" # "voc" or "weizmann"
-BASELINE_ONLY = "0" # "0" for no or "1" for yes, run only the pretrained NN and exit
-RUN_MODE = "middle"  # "fast", "middle", "normal"
+DATASET = "voc" # "voc" or "coco" or "aoi"
+BASELINE_ONLY = False # run only the pretrained NN and exit
+RUN_MODE = "normal"  # "fast", "middle", "normal"
 randomSeeds = 12
-Run_title_SUFFIX = "test" # Optional suffix for run name
+Run_title_SUFFIX = "NN-ensemble" # Optional suffix for run name
+
+# ---- Class selection (static config, no CLI) ----
+# Set to a list of dataset label IDs to include. Example for COCO/VOC: [2,5,17]
+# Leave as None to include all dataset classes.
+SELECTED_CLASSES: list[int] | None = None
+#SELECTED_CLASSES = [0, 255, 15, 8, 12]  # Example for AOI dataset: all classes
+
+# Optional: override the output number of classes, else len(SELECTED_CLASSES) or dataset default
+NUM_CLASSES_OVERRIDE: int | None = None
+
+# Default ignore index for excluded pixels
+DEFAULT_IGNORE_INDEX = 255
+
+CUSTOM_MODEL_PATH = "/dataB1/aoi/benchmarks/model_library/ensemble_models/v2/ensemble_model_1.pth"
+felgp_fs.set_custom_model(
+    path=CUSTOM_MODEL_PATH,
+    model_builder=None,      # full module -> no builder
+    normalize=True,          # set False if your model already handles normalization
+    eager_load=False         # set True to load immediately
+)
 
 # region ==== GP Setup ====
 
@@ -38,30 +59,86 @@ creator.FitnessMax: Any  # type: ignore
 creator.Individual: Any  # type: ignore
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Infer number of classes from dataset selection; allow optional override.
+# Infer number of classes from dataset selection
 if DATASET == 'voc':
-    inferred_classes = 21
-elif DATASET == 'weizmann':
-    inferred_classes = 1
+    inferred_classes = 22
+elif DATASET == 'coco':
+    inferred_classes = 81
+elif DATASET == 'aoi':
+    inferred_classes = 5
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
 
-NUM_CLASSES = inferred_classes
+# Resolve NUM_CLASSES based on selected classes and override
+if SELECTED_CLASSES and len(SELECTED_CLASSES) > 0:
+    NUM_CLASSES = NUM_CLASSES_OVERRIDE if NUM_CLASSES_OVERRIDE is not None else len(SELECTED_CLASSES)
+else:
+    NUM_CLASSES = NUM_CLASSES_OVERRIDE if NUM_CLASSES_OVERRIDE is not None else inferred_classes
 
 
 if DATASET == 'voc':
     dataSetName = 'Pascal_VOC'
     image_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_train_val/VOC2012_train_val/JPEGImages"
     mask_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_train_val/VOC2012_train_val/SegmentationClass"
-elif DATASET == 'weizmann':
-    dataSetName = 'weizmann_horse'
-    image_dir = "data/weizmann_horse/horse"
-    mask_dir = "data/weizmann_horse/mask"
+elif DATASET == 'coco':
+    dataSetName = 'COCO'
+    image_dir = "/dataB1/niels_witbreuk/data/coco/images"
+    mask_dir = "/dataB1/niels_witbreuk/data/coco/masks"
+elif DATASET == 'aoi':
+    dataSetName = 'aoi'
+    image_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/test/img"
+    mask_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/test/lbl"
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
 
-dataset = GeneralSegDataset(image_dir=image_dir, mask_dir=mask_dir, mode="png", color_mode=COLOR_MODE, num_classes=NUM_CLASSES)
-IGNORE_INDEX = getattr(dataset, 'ignore_index', None)
+# Build class remap if classes are specified: map selected IDs -> [0..K-1], others -> ignore
+def _build_class_remap(selected: list[int] | None, k: int):
+    if not selected:
+        return None, None
+    selected = [cid for cid in selected if cid != DEFAULT_IGNORE_INDEX]
+    class_to_idx = {cid: i for i, cid in enumerate(selected[:k])}
+    ignore_index = DEFAULT_IGNORE_INDEX
+    return class_to_idx, ignore_index
+
+CLASS_TO_IDX, IGNORE_INDEX_DEFAULT = _build_class_remap(SELECTED_CLASSES, NUM_CLASSES)
+
+dataset = GeneralSegDataset(
+    image_dir=image_dir,
+    mask_dir=mask_dir,
+    mode="png",
+    color_mode=COLOR_MODE,
+    num_classes=NUM_CLASSES,
+    # If your dataset supports these kwargs, it will handle filtering/remap internally.
+    #include_classes=SELECTED_CLASSES,   # implement in GeneralSegDataset if not present
+    #ignore_index=IGNORE_INDEX_DEFAULT
+)
+
+# Fallback: if dataset doesn't implement include_classes/ignore_index, wrap to remap masks.
+IGNORE_INDEX = getattr(dataset, 'ignore_index', IGNORE_INDEX_DEFAULT)
+
+def _remap_mask_tensor(mask: torch.Tensor, class_to_idx: dict[int, int], ignore_index: int) -> torch.Tensor:
+    if mask.dim() == 3 and mask.shape[0] == 1:
+        mask = mask.squeeze(0)
+    out = torch.full_like(mask, ignore_index)
+    # Efficient remap using vectorized approach
+    for cid, new_idx in class_to_idx.items():
+        out = torch.where(mask == cid, torch.as_tensor(new_idx, dtype=out.dtype, device=out.device), out)
+    return out
+
+class _RemapWrapper(torch.utils.data.Dataset):
+    def __init__(self, base, class_to_idx: dict[int,int] | None, ignore_index: int | None):
+        self.base = base
+        self.class_to_idx = class_to_idx
+        self.ignore_index = ignore_index
+    def __len__(self): return len(self.base)
+    def __getitem__(self, i):
+        img, mask = self.base[i]
+        if self.class_to_idx is not None and self.ignore_index is not None:
+            mask = _remap_mask_tensor(mask, self.class_to_idx, self.ignore_index)
+        return img, mask
+if CLASS_TO_IDX is not None:
+    dataset = _RemapWrapper(dataset, CLASS_TO_IDX, IGNORE_INDEX)
+
 RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
 
 
@@ -72,11 +149,12 @@ RUN_NAME = data_handling.make_run_name(
     seed=randomSeeds,
     color_mode=COLOR_MODE,
     suffix=Run_title_SUFFIX,
-    baseline_only=bool(int(BASELINE_ONLY)) if isinstance(BASELINE_ONLY, str) else bool(BASELINE_ONLY),
+    baseline_only=BASELINE_ONLY,
 )
 
 # Presets per mode
 _PRESETS = {
+    "aoi":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 1, "cap_train": 10,  "cap_test": 5},
     "fast":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 4, "cap_train": 80,  "cap_test": 32},
     "middle": {"pop_size": 25, "generation": 15, "initialMaxDepth": 7, "maxDepth": 7,  "batch_size": 6, "cap_train": 200, "cap_test": 80},
     "normal": {"pop_size": 50, "generation": 30, "initialMaxDepth": 8, "maxDepth": 8,  "batch_size": 8, "cap_train": 400, "cap_test": 160},
@@ -118,6 +196,7 @@ if _MODE_CAP_TRAIN is not None or _MODE_CAP_TEST is not None:
     train_idx = list(range(min(max_train, len(train_dataset))))
     test_idx  = list(range(min(max_test, len(test_dataset))))
     train_dataset = Subset(train_dataset, train_idx)
+    test_dataset  = Subset(test_dataset, test_idx)
   
 
 # DataLoaders: increase workers and pin memory for CUDA
@@ -132,7 +211,7 @@ test_loader  = DataLoader(test_dataset, batch_size=_MODE_BATCH_SIZE,
 
 # Optional: run only the pretrained baseline and exit early
 if BASELINE_ONLY:
-    print(f"[Baseline] Evaluating pretrained_seg_nn on dataset '{dataSetName}' (classes={NUM_CLASSES})...")
+    print(f"[Baseline] Evaluating pretrained_seg_nn on dataset '{dataSetName}' (classes={NUM_CLASSES}, selected={SELECTED_CLASSES})...")
     from types import SimpleNamespace
     args_ns = SimpleNamespace(run_name=RUN_NAME, outdir=RUN_OUTDIR, no_git_check=False)
     run_dir, meta = data_handling._make_run_dir(args_ns, dataSetName, randomSeeds)
@@ -152,6 +231,7 @@ if BASELINE_ONLY:
             "RUN_MODE": RUN_MODE,
             "color_mode": COLOR_MODE,
             "num_classes": NUM_CLASSES,
+            "selected_classes": SELECTED_CLASSES,
         },
         args=args_ns,
         meta=meta,
@@ -175,11 +255,15 @@ params = {
         "maxDepth": maxDepth,
         "train_batch_size": train_loader.batch_size,
         "test_batch_size": test_loader.batch_size,
+        "train_dataset_size": len(train_dataset),
+        "test_dataset_size": len(test_dataset),
         "color_mode": COLOR_MODE,
         "num_classes": NUM_CLASSES,
         "image_dir": image_dir,
         "mask_dir": mask_dir,
     }
+params["selected_classes"] = SELECTED_CLASSES
+params["ignore_index"] = IGNORE_INDEX
 
 # endregion ==== GP Setup ====
 
@@ -192,67 +276,52 @@ pset = gp.PrimitiveSetTyped('MAIN', [_INPUT_TYPE], _OUTPUT_TYPE, prefix='Image')
 
 # Add Basic Math Operators
 # Math operators operate on intermediate feature maps
-pset.addPrimitive(felgp_fs.add, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Add")
-pset.addPrimitive(felgp_fs.sub, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Sub")
-pset.addPrimitive(felgp_fs.mul, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Mul")
-pset.addPrimitive(felgp_fs.safe_div, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="SafeDiv")
-pset.addPrimitive(felgp_fs.abs_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Abs")
-pset.addPrimitive(felgp_fs.sqrt_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Sqrt")
-pset.addPrimitive(felgp_fs.log_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Log")
-pset.addPrimitive(felgp_fs.exp_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="Exp")
-pset.addPrimitive(felgp_fs.sigmoid, [seg_types.FeatureMap], seg_types.FeatureMap, name="Sigmoid")
-pset.addPrimitive(felgp_fs.tanh_f, [seg_types.FeatureMap], seg_types.FeatureMap, name="tanh")
+tp = felgp_fs.trace_primitive
+pset.addPrimitive(tp("Add", felgp_fs.add), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Add")
+pset.addPrimitive(tp("Sub", felgp_fs.sub), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Sub")
+pset.addPrimitive(tp("Mul", felgp_fs.mul), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Mul")
+pset.addPrimitive(tp("SafeDiv", felgp_fs.safe_div), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="SafeDiv")
+pset.addPrimitive(tp("Abs", felgp_fs.abs_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Abs")
+pset.addPrimitive(tp("Sqrt", felgp_fs.sqrt_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Sqrt")
+pset.addPrimitive(tp("Log", felgp_fs.log_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Log")
+pset.addPrimitive(tp("Exp", felgp_fs.exp_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Exp")
+pset.addPrimitive(tp("Sigmoid", felgp_fs.sigmoid), [seg_types.FeatureMap], seg_types.FeatureMap, name="Sigmoid")
+pset.addPrimitive(tp("tanh", felgp_fs.tanh_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="tanh")
 
-# Add logical operators
-pset.addPrimitive(felgp_fs.logical_not, [seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalNot")
-pset.addPrimitive(felgp_fs.logical_or, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalOr")
-pset.addPrimitive(felgp_fs.logical_and, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalAnd")
-pset.addPrimitive(felgp_fs.logical_xor, [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalXor")
+pset.addPrimitive(tp("LogicalNot", felgp_fs.logical_not), [seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalNot")
+pset.addPrimitive(tp("LogicalOr", felgp_fs.logical_or), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalOr")
+pset.addPrimitive(tp("LogicalAnd", felgp_fs.logical_and), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalAnd")
+pset.addPrimitive(tp("LogicalXor", felgp_fs.logical_xor), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalXor")
 
-# Add comparison and normalization
-pset.addPrimitive(felgp_fs.gt, [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Gt")
-pset.addPrimitive(felgp_fs.lt, [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Lt")
-pset.addPrimitive(felgp_fs.normalize, [seg_types.FeatureMap], seg_types.FeatureMap, name="Normalize")
+pset.addPrimitive(tp("Gt", felgp_fs.gt), [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Gt")
+pset.addPrimitive(tp("Lt", felgp_fs.lt), [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Lt")
+pset.addPrimitive(tp("Normalize", felgp_fs.normalize), [seg_types.FeatureMap], seg_types.FeatureMap, name="Normalize")
 
-# Note: Do not add RGB/Gray converters; keep primitive set strictly within selected color mode
-
-# Add filters and edge detection functions (color-mode specific)
-if COLOR_MODE == "rgb":
-    pset.addPrimitive(felgp_fs.sobel_x, [seg_types.RGBImage], seg_types.FeatureMap, name="SobelX")
-    pset.addPrimitive(felgp_fs.sobel_y, [seg_types.RGBImage], seg_types.FeatureMap, name="SobelY")
-    pset.addPrimitive(felgp_fs.laplacian, [seg_types.RGBImage], seg_types.FeatureMap, name="Laplacian")
-    pset.addPrimitive(felgp_fs.gradient_magnitude, [seg_types.RGBImage], seg_types.FeatureMap, name="GradientMagnitude")
-else:  # gray
-    pset.addPrimitive(felgp_fs.sobel_x, [seg_types.GrayImage], seg_types.FeatureMap, name="SobelX_Gray")
-    pset.addPrimitive(felgp_fs.sobel_y, [seg_types.GrayImage], seg_types.FeatureMap, name="SobelY_Gray")
-    pset.addPrimitive(felgp_fs.laplacian, [seg_types.GrayImage], seg_types.FeatureMap, name="Laplacian_Gray")
-    pset.addPrimitive(felgp_fs.gradient_magnitude, [seg_types.GrayImage], seg_types.FeatureMap, name="GradientMagnitude_Gray")
+pset.addPrimitive(tp("SobelX", felgp_fs.sobel_x), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="SobelX")
+pset.addPrimitive(tp("SobelY", felgp_fs.sobel_y), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="SobelY")
+pset.addPrimitive(tp("Laplacian", felgp_fs.laplacian), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="Laplacian")
+pset.addPrimitive(tp("GradientMagnitude", felgp_fs.gradient_magnitude), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="GradientMagnitude")
 
 # Combination functions
-pset.addPrimitive(felgp_fs.mix, [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="Mix")
-pset.addPrimitive(felgp_fs.if_then_else, [seg_types.FeatureMap, seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="IfElse")
-if COLOR_MODE == "rgb":
-    pset.addPrimitive(felgp_fs.gaussian_blur_param, [seg_types.RGBImage, float], seg_types.FeatureMap, name="Gauss")
-else:
-    pset.addPrimitive(felgp_fs.gaussian_blur_param, [seg_types.GrayImage, float], seg_types.FeatureMap, name="Gauss_Gray")
+pset.addPrimitive(tp("Mix", felgp_fs.mix), [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="Mix")
+pset.addPrimitive(tp("IfElse", felgp_fs.if_then_else), [seg_types.FeatureMap, seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="IfElse")
+pset.addPrimitive(tp("Gauss", felgp_fs.gaussian_blur_param), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="Gauss")
 
 """ Pretrained segmentation NN and higher-level image->features (color-mode specific). """
-if COLOR_MODE == "rgb":
-    pset.addPrimitive(felgp_fs.pretrained_seg_nn, [seg_types.RGBImage], seg_types.FeatureMap, name="PretrainedSeg")
-    pset.addPrimitive(felgp_fs.apply_depthwise_edge, [seg_types.RGBImage, float], seg_types.FeatureMap, name="EdgeFilter")
-    pset.addPrimitive(felgp_fs.image_to_featuremap, [seg_types.RGBImage, float], seg_types.FeatureMap, name="ImageToFeat")
-else:
-    # gray mode: register pretrained as feature extractor
-    pset.addPrimitive(felgp_fs.pretrained_seg_nn, [seg_types.GrayImage], seg_types.FeatureMap, name="PretrainedSeg")
-    pset.addPrimitive(felgp_fs.apply_depthwise_edge, [seg_types.GrayImage, float], seg_types.FeatureMap, name="EdgeFilterGray")
-    pset.addPrimitive(felgp_fs.image_to_featuremap, [seg_types.GrayImage, float], seg_types.FeatureMap, name="ImageToFeatGray")
+#pset.addPrimitive(tp("NNsegmenter", felgp_fs.pretrained_seg_nn), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="NNsegmenter")
+if RUN_MODE == "aoi":
+    pset.addPrimitive(tp("aoiModel", felgp_fs.custom_model_infer), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="aoiModel")
+pset.addPrimitive(tp("NNFeatExt", felgp_fs.nn_feature_extractor), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="NNFeatExt")
+pset.addPrimitive(tp("EdgeFilter", felgp_fs.apply_depthwise_edge), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="EdgeFilter")
+pset.addPrimitive(tp("ImageToFeat", felgp_fs.image_to_featuremap), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="ImageToFeat")
+pset.addPrimitive(tp("ASPPCached", felgp_fs.apply_aspp_cached), [seg_types.FeatureMap, float], seg_types.FeatureMap, name="ASPPCached")
+pset.addPrimitive(tp("MNV3Small", felgp_fs.mobilenet_v3_small_feats), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="MNV3Small")
+pset.addPrimitive(tp("ShuffleV2", felgp_fs.shufflenet_v2_x1_0_feats), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="ShuffleV2")
+pset.addPrimitive(tp("ResNet18F", felgp_fs.resnet18_feats), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="ResNet18F")
 
-
-pset.addPrimitive(felgp_fs.apply_aspp_cached, [seg_types.FeatureMap, float], seg_types.FeatureMap, name="ASPPCached")
 
 if NUM_CLASSES == 1:
-    # Only include single-channel collapse in binary mode
-    pset.addPrimitive(felgp_fs.apply_feature_to_mask_cached, [seg_types.FeatureMap, float], seg_types.Mask, name="FeatToMask")
+    pset.addPrimitive(tp("FeatToMask", felgp_fs.apply_feature_to_mask_cached), [seg_types.FeatureMap, float], seg_types.Mask, name="FeatToMask")
 
 # Collect available primitives (name and typed signature) for run info
 AVAILABLE_PRIMITIVES = _enumerate_primitives(pset)
@@ -308,6 +377,37 @@ def _binarize_from_logits(logits):
     preds = (probs > 0.5).float()
     return preds, probs
 
+def _align_to_mask(out: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    """
+    Align output tensor to the mask tensor in terms of batch size and spatial dimensions.
+    Args:
+        out: Output tensor from the model. Shape can be (B,C,H,W), (C,H,W), (H,W), etc.
+        masks: Ground truth mask tensor. Shape can be (B,1,H,W), (1,H,W), (H,W), etc.
+    Returns:
+        Aligned output tensor with same batch size and spatial dimensions as masks.
+    """
+    # Ensure 4D
+    if masks.dim() == 3:
+        masks = masks.unsqueeze(1)
+    if out.dim() == 3:
+        out = out.unsqueeze(1)
+    if out.dim() == 2:
+        out = out.unsqueeze(0).unsqueeze(0)
+    if masks.dim() == 2:
+        masks = masks.unsqueeze(0).unsqueeze(0)
+    # Batch align
+    if out.shape[0] != masks.shape[0]:
+        # replicate or trim
+        if out.shape[0] == 1:
+            out = out.repeat(masks.shape[0], 1, 1, 1)
+        else:
+            out = out[:masks.shape[0]]
+    oh, ow = out.shape[-2:]
+    mh, mw = masks.shape[-2:]
+    if (oh, ow) != (mh, mw):
+        out = F.interpolate(out, size=(mh, mw), mode='bilinear', align_corners=False)
+    return out
+
 def _ensure_k_channels(x: torch.Tensor, k: int) -> torch.Tensor:
     # Project channel dimension to k using cached 1x1 conv in felgp_fs
     if x.dim() == 3:
@@ -325,6 +425,15 @@ def _ensure_k_channels(x: torch.Tensor, k: int) -> torch.Tensor:
     return x
 
 def _multiclass_preds(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert raw logits to predicted class labels and probabilities for multiclass segmentation.
+    Args:
+        logits: Raw output logits from the model. Shape can be (B,C,H,W), (B,H,W), or (C,H,W).
+        k: Number of classes.
+    Returns:
+        preds: Predicted class labels. Shape (B,H,W).
+        probs: Class probabilities. Shape (B,C,H,W).
+    """
     # logits: (B,C,H,W) or (B,H,W) or (C,H,W)
     if not logits.dtype.is_floating_point:
         logits = logits.float()
@@ -342,27 +451,18 @@ def _multiclass_preds(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch
 
 def evalTrain(toolbox, individual, hof):
     """
-    Evaluate the fitness of an individual on the training data.
-    If the individual is in the Hall of Fame, reuse its fitness.
-    Otherwise, compile and execute the individual, compute predictions,
-    and return classification accuracy as fitness.
-
+    Evaluate the GP individual on the training set.
     Args:
         toolbox: DEAP toolbox with compile method.
         individual: The GP individual to evaluate.
-        hof: Hall of Fame list of individuals.
-        trainData: Training data (features).
-        trainLabel: Training labels.
-
+        hof: Hall of Fame individuals to reuse fitness if available.
     Returns:
-        Tuple containing accuracy as a single-element tuple.
+        Tuple with mean Dice score (binary) or mean IoU (multiclass) on the training set.
     """
-    # Check if individual is in Hall of Fame
     for h in (hof or []):
         if individual == h:
             return h.fitness.values
     try:
-        # Binary mode: keep existing Dice computation (dataset-level aggregation possible but left unchanged)
         if NUM_CLASSES == 1:
             func = toolbox.compile(expr=individual)
             inter_total = 0.0
@@ -370,14 +470,16 @@ def evalTrain(toolbox, individual, hof):
             with torch.no_grad():
                 for imgs, masks in train_loader:
                     imgs, masks = imgs.to(device), masks.to(device)
-                    out = func(imgs)
+                    out = func(imgs)                            # compute first
+                    out = _align_to_mask(out, masks)           # then align
                     preds, probs = _binarize_from_logits(out)
+                    #if preds.dim() == 4 and masks.dim() == 4 and preds.shape[-2:] != masks.shape[-2:]:
+                    #    preds = F.interpolate(preds, size=masks.shape[-2:], mode='nearest')
                     inter_total += float((preds * masks).sum().item())
                     union_total += float(preds.sum().item() + masks.sum().item())
             dice = (2.0 * inter_total / (union_total + 1e-6)) if union_total > 0 else 0.0
             return (dice,)
         else:
-            # Multiclass: dataset-level mIoU (background excluded by helper when NUM_CLASSES>1)
             _, miou = eval_dataset_miou(toolbox, individual, train_loader, NUM_CLASSES, device=device, ignore_index=IGNORE_INDEX)
             return (miou,)
     except Exception as e:
@@ -441,15 +543,17 @@ def evalTest(toolbox, individual, test_loader):
     """
     try:
         if NUM_CLASSES == 1:
-            # Binary: dataset-level Dice
             func = toolbox.compile(expr=individual)
             inter_total = 0.0
             union_total = 0.0
             with torch.no_grad():
                 for imgs, masks in test_loader:
                     imgs, masks = imgs.to(device), masks.to(device)
-                    out = func(imgs)
+                    out = func(imgs)                            # compute first
+                    out = _align_to_mask(out, masks)           # then align
                     preds, probs = _binarize_from_logits(out)
+                    #if preds.dim() == 4 and masks.dim() == 4 and preds.shape[-2:] != masks.shape[-2:]:
+                    #    preds = F.interpolate(preds, size=masks.shape[-2:], mode='nearest')
                     inter_total += float((preds * masks).sum().item())
                     union_total += float(preds.sum().item() + masks.sum().item())
             dice = (2.0 * inter_total / (union_total + 1e-6)) if union_total > 0 else 0.0
@@ -514,7 +618,4 @@ if __name__ == "__main__":
 
     data_handling._copy_slurm_logs(run_dir, meta)
     print("testResults", testResults)
-
-
-    data_handling.saveAllResults(params, hof, trainTime, testResults, log, outdir=run_dir)
 
