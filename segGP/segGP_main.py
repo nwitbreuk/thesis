@@ -1,6 +1,7 @@
 import operator
 import argparse
 import random
+from tqdm import tqdm
 import torch
 from torch.utils.data import random_split, DataLoader
 import os
@@ -31,6 +32,10 @@ BASELINE_ONLY = False # run only the pretrained NN and exit
 RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi"
 randomSeeds = 12
 Run_title_SUFFIX = ""  # Optional suffix for run name
+
+# ---- Fitness Function Selection ----
+# Options: "dice" (binary), "miou" (multiclass IoU), "weighted_ce" (weighted cross-entropy)
+FITNESS_FUNCTION = "weighted_ce"  # Change to "weighted_ce" to enable weighted loss
 
 # ---- Class selection (static config, no CLI) ----
 # Set to a list of dataset label IDs to include. Example for COCO/VOC: [2,5,17]
@@ -188,29 +193,23 @@ test_loader  = DataLoader(test_dataset, batch_size=_MODE_BATCH_SIZE,
                           num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
 
 # --- Calculate class weights for weighted loss ---
+# Calculate weights ONLY if using weighted loss
 def calculate_class_weights(loader, num_classes, ignore_idx):
-    """Calculates class weights inversely proportional to their frequency."""
-    print("Calculating class weights for weighted loss...")
-    from tqdm import tqdm
-    counts = torch.zeros(num_classes, device=device)
-    pbar = tqdm(loader, desc="Counting classes", leave=False)
-    for _, masks in pbar:
-        masks = masks.to(device)
-        for i in range(num_classes):
-            if i == ignore_idx: continue
-            counts[i] += (masks == i).sum()
-    
-    # Inverse frequency weighting
-    total_valid_pixels = counts.sum()
-    class_weights = total_valid_pixels / (counts + 1e-6)
-    
-    # Normalize weights to prevent instability
-    class_weights = class_weights / class_weights.sum() * num_classes
-    print(f"Calculated weights: {class_weights.cpu().numpy()}")
-    return class_weights.float()
+        print("Calculating class weights for weighted loss...")
+        counts = torch.zeros(num_classes, device=device)
+        for _, masks in tqdm(loader, desc="Counting classes", leave=False, disable=True):
+            masks = masks.to(device)
+            for i in range(num_classes):
+                if i == ignore_idx: continue
+                counts[i] += (masks == i).sum()
+        total_valid_pixels = counts.sum()
+        class_weights = total_valid_pixels / (counts + 1e-6)
+        class_weights = class_weights / class_weights.sum() * num_classes
+        print(f"Calculated weights: {class_weights.cpu().numpy()}")
+        return class_weights.float()
 
-# Calculate weights before GP run
-if NUM_CLASSES > 1:
+class_weights = None
+if FITNESS_FUNCTION == "weighted_ce" and NUM_CLASSES > 1:
     class_weights = calculate_class_weights(train_loader, NUM_CLASSES, IGNORE_INDEX)
 else:
     class_weights = None
@@ -460,43 +459,56 @@ def _multiclass_preds(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch
     return preds, probs
 
 def evalTrain(toolbox, individual, hof):
-    """
-    Evaluate the GP individual on the training set using weighted cross-entropy loss.
-    This is the new fitness function to handle class imbalance.
-    """
     for h in (hof or []):
         if individual == h:
             return h.fitness.values
     try:
         func = toolbox.compile(expr=individual)
-        total_loss = 0.0
-        batch_count = 0
-        with torch.no_grad():
-            for imgs, masks in train_loader:
-                imgs, masks = imgs.to(device), masks.to(device)
-                logits = func(imgs)
-                logits = _align_to_mask(logits, masks)
-                logits = _ensure_k_channels(logits, NUM_CLASSES)
-                
-                # Reshape for loss function
-                logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, NUM_CLASSES)
-                masks_flat = masks.view(-1).long()
-
-                # Calculate weighted cross-entropy loss
-                loss = F.cross_entropy(logits_flat, masks_flat, weight=class_weights, ignore_index=IGNORE_INDEX) # type: ignore
-                
-                if torch.isinf(loss) or torch.isnan(loss): continue
-                total_loss += loss.item()
-                batch_count += 1
         
-        avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
-        # Return negative loss because DEAP maximizes fitness
-        return (-avg_loss,)
-
+        if FITNESS_FUNCTION == "weighted_ce" and NUM_CLASSES > 1:
+            # Weighted cross-entropy fitness
+            total_loss = 0.0
+            batch_count = 0
+            with torch.no_grad():
+                for imgs, masks in train_loader:
+                    imgs, masks = imgs.to(device), masks.to(device)
+                    logits = func(imgs)
+                    logits = _align_to_mask(logits, masks)
+                    logits = _ensure_k_channels(logits, NUM_CLASSES)
+                    
+                    logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, NUM_CLASSES)
+                    masks_flat = masks.view(-1).long()
+                    loss = F.cross_entropy(logits_flat, masks_flat, weight=class_weights, ignore_index=IGNORE_INDEX) # type: ignore
+                    
+                    if torch.isinf(loss) or torch.isnan(loss): continue
+                    total_loss += loss.item()
+                    batch_count += 1
+            
+            avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
+            return (-avg_loss,)  # Negative because DEAP maximizes
+        
+        elif NUM_CLASSES == 1:
+            # Binary Dice fitness
+            inter_total = 0.0
+            union_total = 0.0
+            with torch.no_grad():
+                for imgs, masks in train_loader:
+                    imgs, masks = imgs.to(device), masks.to(device)
+                    out = func(imgs)
+                    out = _align_to_mask(out, masks)
+                    preds, probs = _binarize_from_logits(out)
+                    inter_total += float((preds * masks).sum().item())
+                    union_total += float(preds.sum().item() + masks.sum().item())
+            dice = (2.0 * inter_total / (union_total + 1e-6)) if union_total > 0 else 0.0
+            return (dice,)
+        else:
+            # Standard mIoU fitness
+            _, miou = eval_dataset_miou(toolbox, individual, train_loader, NUM_CLASSES, device=device, ignore_index=IGNORE_INDEX)
+            return (miou,)
+    
     except Exception as e:
-        import traceback
-        print(f"Evaluation error (train): {e}\n{traceback.format_exc()}")
-        return (float('-inf'),)
+        print("Evaluation error (train):", e)
+        return (float('-inf'),) if FITNESS_FUNCTION == "weighted_ce" else (0.0,)
 
 
 toolbox.register("evaluate", evalTrain,toolbox)
