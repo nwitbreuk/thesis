@@ -28,7 +28,7 @@ import sys
 COLOR_MODE = "rgb"  # "rgb" or "gray"
 DATASET = "coco" # "voc" or "coco" or "aoi"
 BASELINE_ONLY = False # run only the pretrained NN and exit
-RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi"
+RUN_MODE = "normal"  # "fast", "middle", "normal" or "aoi"
 randomSeeds = 12
 Run_title_SUFFIX = ""  # Optional suffix for run name
 

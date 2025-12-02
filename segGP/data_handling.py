@@ -334,7 +334,7 @@ class ImagePreFilterWrapper(Dataset):
         self.require_all = require_all
         self.min_match = (len(self.selected_ids) if require_all else (min_match or 1))
         print(f"Pre-filtering dataset to find images with at least {self.min_match} of {sorted(self.selected_ids)}...")
-        for i in tqdm(range(len(self.base)), desc="Scanning masks"):  # type: ignore
+        for i in tqdm(range(len(self.base)), desc="Scanning masks", disable=True):  # type: ignore
             try:
                 _, mask = self.base[i]
             except Exception:
