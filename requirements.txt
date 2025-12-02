@@ -4,3 +4,4 @@ matplotlib
 scikit-image
 scikit-learn
 deap
+tqdm>=4.66

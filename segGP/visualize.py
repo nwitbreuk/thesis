@@ -1,3 +1,4 @@
+from tkinter.messagebox import IGNORE
 import matplotlib.pyplot as plt
 import os
 import numpy as np
@@ -41,6 +42,35 @@ def _to_imshow(img_t):
         return arr[0], 'gray'
     # Fallback for unexpected dims: squeeze and recurse
     return _to_imshow(_np.squeeze(arr))
+
+def _colorize_mask(mask_2d: torch.Tensor, k: int):
+    """Colorize a 2D mask tensor of shape (H,W) with k classes into an RGB image.
+    Assumes class ids in [0, k-1], with possible ignore index 255.
+    Returns a (H,W,3) uint8 NumPy array.
+    """   
+    m = mask_2d.detach().cpu().numpy().astype(np.int32)
+    h, w = m.shape
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    # Create palette for k classes (0..k-1)
+    # We use a distinct colormap
+    pal = plt.get_cmap('tab20', max(2, k))
+    pal_rgb = (pal(np.arange(max(2, k)))[:, :3] * 255).astype(np.uint8)
+    
+    # Identify ignore regions (255)
+    ignore_mask = (m == 255)
+    valid_mask = ~ignore_mask
+    
+    # Color valid pixels
+    # Clip only valid pixels to range [0, k-1] to be safe
+    if valid_mask.any():
+        idx = np.clip(m[valid_mask], 0, k - 1)
+        out[valid_mask] = pal_rgb[idx]
+        
+    # Color ignore pixels as Gray
+    out[ignore_mask] = np.array([192, 192, 192], dtype=np.uint8)
+    
+    return out
 
 def visualize_predictions(toolbox, individual, dataset, num_samples=3, threshold=0.5, save_dir=None, num_classes=None):
     """
@@ -102,17 +132,30 @@ def visualize_predictions(toolbox, individual, dataset, num_samples=3, threshold
             # multiclass display
             if ncls is None:
                 ncls = int(out.shape[1])
-            cmap = plt.get_cmap('tab20', max(2, ncls))
-            axs[1].imshow(pred_np, cmap=cmap, vmin=0, vmax=max(1, ncls-1))
+            
+            # Get the raw prediction indices (0 to k-1)
+            pred_indices = pred.squeeze(0).squeeze(0)
+            
+            # Get the ground truth mask and find where the ignore_index is
+            gt_mask_for_ignore = mask_t.squeeze(0) if mask_t.dim()==3 else mask_t
+            ignore_pixels = (gt_mask_for_ignore == 255)
+
+            # Create a new prediction mask where ignored pixels are set to 255
+            pred_with_ignore = pred_indices.clone()
+            pred_with_ignore[ignore_pixels] = 255
+
+            pred_mc = _colorize_mask(pred_with_ignore, ncls)
+            axs[1].imshow(pred_mc)
             axs[1].set_title("Prediction")
-            axs[2].imshow(mask_np, cmap=cmap, vmin=0, vmax=max(1, ncls-1))
-            axs[2].set_title("Ground Truth")
+
+            mc = _colorize_mask(gt_mask_for_ignore, ncls)
+            axs[2].imshow(mc); axs[2].set_title("Ground Truth - multiclass")
         else:
             # binary display
             axs[1].imshow(pred_np, cmap='gray')
             axs[1].set_title("Prediction")
             axs[2].imshow(mask_np, cmap='gray')
-            axs[2].set_title("Ground Truth")
+            axs[2].set_title("Ground Truth - binary")
         for ax in axs: ax.axis('off')
         fig.tight_layout()
 

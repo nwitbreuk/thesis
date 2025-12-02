@@ -130,7 +130,14 @@ def _to_numpy_preds_and_targets(preds: torch.Tensor, targets: torch.Tensor, num_
     return pred_flat, targ_flat
 
 
-def eval_dataset_miou(toolbox, individual, data_loader, num_classes: int, device: Optional[str] = None, ignore_index: Optional[int] = 255, max_batches: Optional[int] = None) -> Tuple[np.ndarray, float]:
+def eval_dataset_miou(
+        toolbox, 
+        individual, 
+        data_loader, 
+        num_classes: int,  
+        device: Optional[str] = None, 
+        ignore_index: Optional[int] = 255, 
+        max_batches: Optional[int] = None)-> Tuple[np.ndarray, float]:
     """Evaluate an individual across a DataLoader and return dataset-level IoUs.
 
     Args:

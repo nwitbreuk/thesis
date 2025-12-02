@@ -12,6 +12,11 @@ import torch.nn.functional as F
 
 from deap import gp
 import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+import numpy as np
+
+DEFAULT_IGNORE_INDEX = 255
 
 def pad_collate(batch):
     """
@@ -49,6 +54,7 @@ def make_run_name(dataset_name: str,
                   run_mode: str,
                   seed: int,
                   color_mode: str,
+                  SELECTED_CLASSES: list[int] | None = None,
                   suffix: str | None = None,
                   baseline_only: bool = False) -> str:
     """Construct the RUN_NAME used for output directories.
@@ -60,7 +66,7 @@ def make_run_name(dataset_name: str,
     The string contains a literal "{jid}" placeholder that _make_run_dir
     will replace with SLURM job id or current pid.
     """
-    base = f"{dataset_name}_{run_mode}mode_seed{seed}_{{jid}}_-{color_mode}-{suffix}"
+    base = f"{dataset_name}_{run_mode}mode_seed{seed}_{{jid}}_-{color_mode}-classes{SELECTED_CLASSES}{suffix}"
     
     if baseline_only:
         return f"{base}-NN-only"
@@ -284,3 +290,63 @@ def saveAllResults(params, hof, trainTime, testResults, log, outdir="/dataB1/nie
         print("Warning: failed to write summary file:", e)
 
     return
+
+def build_class_remap(selected: list[int] | None, k: int,
+                      ignore_index: int = DEFAULT_IGNORE_INDEX,
+                      drop_background: bool = False):
+    if not selected:
+        return None, None
+    # exclude ignore and optionally background (0)
+    selected = [cid for cid in selected if cid != ignore_index and (cid != 0 if drop_background else True)]
+    class_to_idx = {cid: i for i, cid in enumerate(selected[:k])}
+    return class_to_idx, ignore_index
+
+def remap_mask_tensor(mask: torch.Tensor, class_to_idx: dict[int, int], ignore_index: int) -> torch.Tensor:
+    if mask.dim() == 3 and mask.shape[0] == 1:
+        mask = mask.squeeze(0)
+    out = torch.full_like(mask, ignore_index)
+    for cid, new_idx in class_to_idx.items():
+        out = torch.where(mask == cid, torch.as_tensor(new_idx, dtype=out.dtype, device=out.device), out)
+    return out
+
+class RemapWrapper(Dataset):
+    def __init__(self, base: Dataset, class_to_idx: dict[int,int] | None, ignore_index: int | None):
+        self.base = base
+        self.class_to_idx = class_to_idx
+        self.ignore_index = ignore_index
+    def __len__(self): return len(self.base)  # type: ignore
+    def __getitem__(self, i):
+        img, mask = self.base[i]
+        if self.class_to_idx and (self.ignore_index is not None):
+            mask = remap_mask_tensor(mask, self.class_to_idx, self.ignore_index)
+        return img, mask
+    
+def _count_matches(present: set[int], wanted: set[int]) -> int:
+    return len(present & wanted)
+class ImagePreFilterWrapper(Dataset):
+    def __init__(self, base_dataset: Dataset, selected_ids: set[int],
+                 ignore_index: int = DEFAULT_IGNORE_INDEX,
+                 require_all: bool = False,
+                 min_match: int | None = None):
+        self.base = base_dataset
+        self.valid_indices = []
+        self.selected_ids = {c for c in selected_ids if c not in (ignore_index, 0)}
+        self.require_all = require_all
+        self.min_match = (len(self.selected_ids) if require_all else (min_match or 1))
+        print(f"Pre-filtering dataset to find images with at least {self.min_match} of {sorted(self.selected_ids)}...")
+        for i in tqdm(range(len(self.base)), desc="Scanning masks"):  # type: ignore
+            try:
+                _, mask = self.base[i]
+            except Exception:
+                continue
+            if not isinstance(mask, torch.Tensor):
+                mask = torch.as_tensor(np.array(mask), dtype=torch.int64)
+            if mask.dim() == 3 and mask.shape[0] == 1:
+                mask = mask.squeeze(0)
+            present = set(int(v) for v in torch.unique(mask).tolist())
+            present.discard(ignore_index); present.discard(0)
+            if _count_matches(present, self.selected_ids) >= self.min_match:
+                self.valid_indices.append(i)
+        print(f"Found {len(self.valid_indices)} / {len(self.base)} images matching the filter.")  # type: ignore
+    def __len__(self): return len(self.valid_indices)
+    def __getitem__(self, idx): return self.base[self.valid_indices[idx]]

@@ -17,8 +17,8 @@ import seggp_functions as felgp_fs
 import seg_types
 from typing import Any, Callable
 from visualize import visualize_predictions
-from data_handling import _enumerate_primitives, _enumerate_terminals, pad_collate
-import data_handling as data_handling
+from data_handling import ImagePreFilterWrapper, RemapWrapper, build_class_remap, _enumerate_primitives, _enumerate_terminals, pad_collate
+import data_handling
 from miou_eval import eval_dataset_miou  # dataset-level mIoU (no penalties integrated)
 from algo_iegp import run_pretrained_baseline  # baseline eval without GP
 import sys
@@ -26,17 +26,20 @@ import sys
 
 # User-configurable options
 COLOR_MODE = "rgb"  # "rgb" or "gray"
-DATASET = "voc" # "voc" or "coco" or "aoi"
+DATASET = "coco" # "voc" or "coco" or "aoi"
 BASELINE_ONLY = False # run only the pretrained NN and exit
-RUN_MODE = "normal"  # "fast", "middle", "normal"
+RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi"
 randomSeeds = 12
-Run_title_SUFFIX = "NN-ensemble" # Optional suffix for run name
+Run_title_SUFFIX = ""  # Optional suffix for run name
 
 # ---- Class selection (static config, no CLI) ----
 # Set to a list of dataset label IDs to include. Example for COCO/VOC: [2,5,17]
 # Leave as None to include all dataset classes.
 SELECTED_CLASSES: list[int] | None = None
-#SELECTED_CLASSES = [0, 255, 15, 8, 12]  # Example for AOI dataset: all classes
+# VOC: 15, 8, 12, 6, 19, 18
+# COCO 1, 67, 7, 65, 59, 22
+# AOI: 16, 31, 30, 24, 23
+SELECTED_CLASSES = [65, 67, 7]  # restrict classes 
 
 # Optional: override the output number of classes, else len(SELECTED_CLASSES) or dataset default
 NUM_CLASSES_OVERRIDE: int | None = None
@@ -71,7 +74,9 @@ else:
 
 # Resolve NUM_CLASSES based on selected classes and override
 if SELECTED_CLASSES and len(SELECTED_CLASSES) > 0:
-    NUM_CLASSES = NUM_CLASSES_OVERRIDE if NUM_CLASSES_OVERRIDE is not None else len(SELECTED_CLASSES)
+    # exclude ignore id when counting output classes
+    _selected_no_ignore = [cid for cid in SELECTED_CLASSES if cid != DEFAULT_IGNORE_INDEX]
+    NUM_CLASSES = NUM_CLASSES_OVERRIDE if NUM_CLASSES_OVERRIDE is not None else len(_selected_no_ignore)
 else:
     NUM_CLASSES = NUM_CLASSES_OVERRIDE if NUM_CLASSES_OVERRIDE is not None else inferred_classes
 
@@ -91,56 +96,28 @@ elif DATASET == 'aoi':
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
 
-# Build class remap if classes are specified: map selected IDs -> [0..K-1], others -> ignore
-def _build_class_remap(selected: list[int] | None, k: int):
-    if not selected:
-        return None, None
-    selected = [cid for cid in selected if cid != DEFAULT_IGNORE_INDEX]
-    class_to_idx = {cid: i for i, cid in enumerate(selected[:k])}
-    ignore_index = DEFAULT_IGNORE_INDEX
-    return class_to_idx, ignore_index
-
-CLASS_TO_IDX, IGNORE_INDEX_DEFAULT = _build_class_remap(SELECTED_CLASSES, NUM_CLASSES)
-
 dataset = GeneralSegDataset(
     image_dir=image_dir,
     mask_dir=mask_dir,
     mode="png",
     color_mode=COLOR_MODE,
-    num_classes=NUM_CLASSES,
-    # If your dataset supports these kwargs, it will handle filtering/remap internally.
-    #include_classes=SELECTED_CLASSES,   # implement in GeneralSegDataset if not present
-    #ignore_index=IGNORE_INDEX_DEFAULT
+    num_classes=NUM_CLASSES
 )
 
-# Fallback: if dataset doesn't implement include_classes/ignore_index, wrap to remap masks.
+# If selected classes are specified, pre-filter images: exclude ignore and background from the filter set
+if SELECTED_CLASSES:
+    target_ids = set(cid for cid in SELECTED_CLASSES if cid not in (DEFAULT_IGNORE_INDEX, 0))
+    if target_ids: 
+        # require_all=True (all classes) or min_match=2 (at least 2 of them)
+        dataset = ImagePreFilterWrapper(dataset, target_ids, ignore_index=DEFAULT_IGNORE_INDEX, require_all=False, min_match=1)
+
+# Build remap and wrap
+CLASS_TO_IDX, IGNORE_INDEX_DEFAULT = build_class_remap(SELECTED_CLASSES, NUM_CLASSES, ignore_index=DEFAULT_IGNORE_INDEX, drop_background=False)
 IGNORE_INDEX = getattr(dataset, 'ignore_index', IGNORE_INDEX_DEFAULT)
-
-def _remap_mask_tensor(mask: torch.Tensor, class_to_idx: dict[int, int], ignore_index: int) -> torch.Tensor:
-    if mask.dim() == 3 and mask.shape[0] == 1:
-        mask = mask.squeeze(0)
-    out = torch.full_like(mask, ignore_index)
-    # Efficient remap using vectorized approach
-    for cid, new_idx in class_to_idx.items():
-        out = torch.where(mask == cid, torch.as_tensor(new_idx, dtype=out.dtype, device=out.device), out)
-    return out
-
-class _RemapWrapper(torch.utils.data.Dataset):
-    def __init__(self, base, class_to_idx: dict[int,int] | None, ignore_index: int | None):
-        self.base = base
-        self.class_to_idx = class_to_idx
-        self.ignore_index = ignore_index
-    def __len__(self): return len(self.base)
-    def __getitem__(self, i):
-        img, mask = self.base[i]
-        if self.class_to_idx is not None and self.ignore_index is not None:
-            mask = _remap_mask_tensor(mask, self.class_to_idx, self.ignore_index)
-        return img, mask
 if CLASS_TO_IDX is not None:
-    dataset = _RemapWrapper(dataset, CLASS_TO_IDX, IGNORE_INDEX)
+    dataset = RemapWrapper(dataset, CLASS_TO_IDX, IGNORE_INDEX)
 
 RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
-
 
 
 RUN_NAME = data_handling.make_run_name(
@@ -150,6 +127,7 @@ RUN_NAME = data_handling.make_run_name(
     color_mode=COLOR_MODE,
     suffix=Run_title_SUFFIX,
     baseline_only=BASELINE_ONLY,
+    SELECTED_CLASSES=SELECTED_CLASSES,
 )
 
 # Presets per mode
@@ -322,6 +300,10 @@ pset.addPrimitive(tp("ResNet18F", felgp_fs.resnet18_feats), [seg_types.GrayImage
 
 if NUM_CLASSES == 1:
     pset.addPrimitive(tp("FeatToMask", felgp_fs.apply_feature_to_mask_cached), [seg_types.FeatureMap, float], seg_types.Mask, name="FeatToMask")
+elif NUM_CLASSES > 1:
+    # Map intermediate FeatureMap -> k-class logits
+    pset.addPrimitive(tp("FeatToLogits", lambda x: felgp_fs.feature_to_logits(x, NUM_CLASSES)),
+                      [seg_types.FeatureMap], seg_types.FeatureMap, name="FeatToLogits")
 
 # Collect available primitives (name and typed signature) for run info
 AVAILABLE_PRIMITIVES = _enumerate_primitives(pset)

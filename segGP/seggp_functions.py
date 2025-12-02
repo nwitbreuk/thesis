@@ -341,6 +341,24 @@ def apply_feature_to_mask_cached(x: torch.Tensor, scale: float = 1.0) -> torch.T
     y = mod(x) * float(scale)
     return _restore_like(y, xin)
 
+def feature_to_logits(x: torch.Tensor, k: int) -> torch.Tensor:
+    """Project a feature map to k-class logits via cached 1x1 conv."""
+    xin = x
+    x4 = _as_nchw(x)
+    B, C, H, W = x4.shape
+    key = ('feat2logits', C, int(k), str(x4.device))
+    mod = _module_cache.get(key)
+    if mod is None:
+        mod = nn.Conv2d(C, int(k), kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(mod.weight)
+        _module_cache[key] = mod
+        _module_cache.move_to_end(key)
+        if len(_module_cache) > _MAX_CACHE_SIZE:
+            _module_cache.popitem(last=False)
+    mod = mod.to(x4.device).to(x4.dtype)
+    y = mod(x4)
+    return _restore_like(y, xin)
+
 
 def ensure_rgb(x: torch.Tensor) -> torch.Tensor:
     """Ensure the tensor is RGB-like (3 channels). If single-channel, replicate; if >3, take first 3."""
@@ -615,6 +633,21 @@ def resnet18_feats(x: torch.Tensor) -> torch.Tensor:
     y = F.interpolate(y, size=x.shape[-2:], mode='bilinear', align_corners=False)
     return _restore_like(y, xin)
 
+def nadia_model(x: torch.Tensor) -> torch.Tensor:
+    """NADIA model feature extractor placeholder.
+    Replace with actual implementation as needed.
+    """
+    xin = x
+    x = _ensure_rgb_norm(x)
+    # Simple conv block as placeholder
+    torch_model_path = '/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts'
+    torch_model_state = torch.load(torch_model_path, map_location=torch.device('cpu'), weights_only=False)
+    if isinstance(torch_model_state, dict) and 'model' in torch_model_state:
+        torch_model_state = torch_model_state['model']
+    
+ 
+    return _restore_like(y, xin)
+
 
 # ----------------- Custom model loader / wrapper -----------------
 _CUSTOM_MODEL = None
@@ -720,7 +753,7 @@ def custom_model_infer(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     if isinstance(y, (list, tuple)):
         y = y[0]
 
-    y = _as_nchw(y) * float(scale)
+    y = _as_nchw(y) * float(scale) # type: ignore
     return _restore_like(y, xin)
 
 
