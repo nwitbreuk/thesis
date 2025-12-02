@@ -12,27 +12,65 @@ import torch.nn.functional as F
 
 from deap import gp
 import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+import numpy as np
+
+DEFAULT_IGNORE_INDEX = 255
 
 def pad_collate(batch):
     """
     Collate function to pad images and masks in a batch to the same size.
-        Args:
-    batch: List of tuples (image, mask).
-        Returns:
-    Padded images and masks as tensors.
+
+    Args:
+        batch: List of tuples (image, mask) where image is (C,H,W) float in [0,1],
+               and mask is either (1,H,W) float (binary) or (H,W) long (multiclass).
+    Returns:
+        (images, masks): both padded to (B,C,H,W). For multiclass masks, C=1 and dtype is long.
     """
-    # batch: List[Tuple[tensor(C,H,W), tensor(C,H,W)]]
     imgs, masks = zip(*batch)
-    max_h = max(t.shape[1] for t in imgs)
-    max_w = max(t.shape[2] for t in imgs)
+    # target spatial size from images
+    max_h = max(t.shape[-2] for t in imgs)
+    max_w = max(t.shape[-1] for t in imgs)
     pad_imgs, pad_masks = [], []
     for im, ms in zip(imgs, masks):
-        dh = max_h - im.shape[1]
-        dw = max_w - im.shape[2]
+        # ensure channel-first
+        if im.dim() == 2:
+            im = im.unsqueeze(0)
+        # make masks 3D (C,H,W) by adding channel if needed
+        if ms.dim() == 2:
+            ms = ms.unsqueeze(0)
+        # compute padding based on image spatial size
+        dh = max_h - im.shape[-2]
+        dw = max_w - im.shape[-1]
         pad = (0, dw, 0, dh)  # (left, right, top, bottom)
         pad_imgs.append(F.pad(im, pad, value=0.0))
-        pad_masks.append(F.pad(ms, pad, value=0.0))
+        # pad masks with ignore-like value for integer masks, else 0.0 for float masks
+        mask_pad_val = 0.0 if ms.dtype.is_floating_point else 255
+        pad_masks.append(F.pad(ms, pad, value=mask_pad_val))
     return torch.stack(pad_imgs, 0), torch.stack(pad_masks, 0)
+
+def make_run_name(dataset_name: str,
+                  run_mode: str,
+                  seed: int,
+                  color_mode: str,
+                  SELECTED_CLASSES: list[int] | None = None,
+                  suffix: str | None = None,
+                  baseline_only: bool = False) -> str:
+    """Construct the RUN_NAME used for output directories.
+
+    Matches the existing format in segGP_main:
+    - base: f"{dataset_name}_{run_mode}mode_seed{seed}_{jid}_{color_mode}-"
+    - when baseline_only=True: append the provided suffix (if any)
+
+    The string contains a literal "{jid}" placeholder that _make_run_dir
+    will replace with SLURM job id or current pid.
+    """
+    base = f"{dataset_name}_{run_mode}mode_seed{seed}_{{jid}}_-{color_mode}-classes{SELECTED_CLASSES}{suffix}"
+    
+    if baseline_only:
+        return f"{base}-NN-only"
+    return base
 
 def _make_run_dir(args, dataset_name, seed):
     timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -58,6 +96,43 @@ def _git_info_safe(repo_dir="."):
         branch = os.environ.get("RUN_BRANCH","unknown")
         commit = os.environ.get("RUN_COMMIT","unknown")
     return branch, commit
+
+# Collect available primitives (name and typed signature) for run info
+def _enumerate_primitives(_pset: gp.PrimitiveSetTyped):
+    prim_list = []
+    try:
+        for _ret, _prims in _pset.primitives.items():
+            for _p in _prims:
+                _args = [getattr(t, '__name__', str(t)) for t in _p.args]
+                _retname = getattr(_p.ret, '__name__', str(_p.ret))
+                prim_list.append(f"{_p.name}({', '.join(_args)}) -> {_retname}")
+    except Exception:
+        # Fallback: at least list names if detailed typing fails
+        try:
+            prim_list = sorted({getattr(p, 'name', str(p)) for v in _pset.primitives.values() for p in v})
+        except Exception:
+            prim_list = []
+    # de-duplicate and sort for readability
+    prim_list = sorted(set(prim_list))
+    return prim_list
+
+# Enumerate available terminals (including ephemeral constants) for run info
+def _enumerate_terminals(_pset: gp.PrimitiveSetTyped):
+    terms = []
+    try:
+        for _ret, _terms in _pset.terminals.items():
+            for _t in _terms:
+                # gp.Terminal typically has .name and .ret
+                _name = getattr(_t, 'name', str(_t))
+                _retname = getattr(_t.ret, '__name__', str(_t.ret))
+                terms.append(f"{_name} -> {_retname}")
+    except Exception:
+        try:
+            # Fallback to names only
+            terms = sorted({getattr(t, 'name', str(t)) for v in _pset.terminals.values() for t in v})
+        except Exception:
+            terms = []
+    return sorted(set(terms))
 
 def _write_run_info(run_dir, meta, args, randomSeeds):
     branch, commit = ("unknown","unknown") if args.no_git_check else _git_info_safe(os.getcwd())
@@ -202,6 +277,7 @@ def saveAllResults(params, hof, trainTime, testResults, log, outdir="/dataB1/nie
 
             f.write("=== FINAL RESULTS ===\n")
             f.write(f"Dataset: {params.get('Dataset')}\n")
+            f.write(f"image_dir: {params.get('image_dir')}\n")
             f.write(f"randomSeeds: {params.get('randomSeeds')}\n")
             f.write(f"trainTime: {trainTime}\n")
             f.write(f"trainResults (hof[0].fitness): {getattr(hof[0], 'fitness', None)}\n")
@@ -214,3 +290,63 @@ def saveAllResults(params, hof, trainTime, testResults, log, outdir="/dataB1/nie
         print("Warning: failed to write summary file:", e)
 
     return
+
+def build_class_remap(selected: list[int] | None, k: int,
+                      ignore_index: int = DEFAULT_IGNORE_INDEX,
+                      drop_background: bool = False):
+    if not selected:
+        return None, None
+    # exclude ignore and optionally background (0)
+    selected = [cid for cid in selected if cid != ignore_index and (cid != 0 if drop_background else True)]
+    class_to_idx = {cid: i for i, cid in enumerate(selected[:k])}
+    return class_to_idx, ignore_index
+
+def remap_mask_tensor(mask: torch.Tensor, class_to_idx: dict[int, int], ignore_index: int) -> torch.Tensor:
+    if mask.dim() == 3 and mask.shape[0] == 1:
+        mask = mask.squeeze(0)
+    out = torch.full_like(mask, ignore_index)
+    for cid, new_idx in class_to_idx.items():
+        out = torch.where(mask == cid, torch.as_tensor(new_idx, dtype=out.dtype, device=out.device), out)
+    return out
+
+class RemapWrapper(Dataset):
+    def __init__(self, base: Dataset, class_to_idx: dict[int,int] | None, ignore_index: int | None):
+        self.base = base
+        self.class_to_idx = class_to_idx
+        self.ignore_index = ignore_index
+    def __len__(self): return len(self.base)  # type: ignore
+    def __getitem__(self, i):
+        img, mask = self.base[i]
+        if self.class_to_idx and (self.ignore_index is not None):
+            mask = remap_mask_tensor(mask, self.class_to_idx, self.ignore_index)
+        return img, mask
+    
+def _count_matches(present: set[int], wanted: set[int]) -> int:
+    return len(present & wanted)
+class ImagePreFilterWrapper(Dataset):
+    def __init__(self, base_dataset: Dataset, selected_ids: set[int],
+                 ignore_index: int = DEFAULT_IGNORE_INDEX,
+                 require_all: bool = False,
+                 min_match: int | None = None):
+        self.base = base_dataset
+        self.valid_indices = []
+        self.selected_ids = {c for c in selected_ids if c not in (ignore_index, 0)}
+        self.require_all = require_all
+        self.min_match = (len(self.selected_ids) if require_all else (min_match or 1))
+        print(f"Pre-filtering dataset to find images with at least {self.min_match} of {sorted(self.selected_ids)}...")
+        for i in tqdm(range(len(self.base)), desc="Scanning masks"):  # type: ignore
+            try:
+                _, mask = self.base[i]
+            except Exception:
+                continue
+            if not isinstance(mask, torch.Tensor):
+                mask = torch.as_tensor(np.array(mask), dtype=torch.int64)
+            if mask.dim() == 3 and mask.shape[0] == 1:
+                mask = mask.squeeze(0)
+            present = set(int(v) for v in torch.unique(mask).tolist())
+            present.discard(ignore_index); present.discard(0)
+            if _count_matches(present, self.selected_ids) >= self.min_match:
+                self.valid_indices.append(i)
+        print(f"Found {len(self.valid_indices)} / {len(self.base)} images matching the filter.")  # type: ignore
+    def __len__(self): return len(self.valid_indices)
+    def __getitem__(self, idx): return self.base[self.valid_indices[idx]]
