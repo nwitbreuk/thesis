@@ -28,14 +28,14 @@ import sys
 # User-configurable options
 COLOR_MODE = "rgb"  # "rgb" or "gray"
 DATASET = "voc" # "voc" or "coco" or "aoi"
-BASELINE_ONLY = False # run only the pretrained NN and exit
-RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi"
+BASELINE_ONLY = True # run only the pretrained NN and exit
+RUN_MODE = "normal"  # "fast", "middle", "normal" or "aoi"
 randomSeeds = 12
 Run_title_SUFFIX = ""  # Optional suffix for run name
 
 # ---- Fitness Function Selection ----
 # Options: "dice" (binary), "miou" (multiclass IoU), "weighted_ce" (weighted cross-entropy)
-FITNESS_FUNCTION = "weighted_ce"  # Change to "weighted_ce" to enable weighted loss
+FITNESS_FUNCTION = "miou"  # Change to "weighted_ce" to enable weighted loss
 
 # ---- Class selection (static config, no CLI) ----
 # Set to a list of dataset label IDs to include. Example for COCO/VOC: [2,5,17]
@@ -92,8 +92,8 @@ if DATASET == 'voc':
     mask_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_train_val/VOC2012_train_val/SegmentationClass"
 elif DATASET == 'coco':
     dataSetName = 'COCO'
-    image_dir = "/dataB1/niels_witbreuk/data/coco/images"
-    mask_dir = "/dataB1/niels_witbreuk/data/coco/masks"
+    image_dir = "/dataB1/niels_witbreuk/data/coco/images+"
+    mask_dir = "/dataB1/niels_witbreuk/data/coco/masks+"
 elif DATASET == 'aoi':
     dataSetName = 'aoi'
     image_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/test/img"
