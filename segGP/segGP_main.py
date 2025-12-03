@@ -4,6 +4,7 @@ import random
 from tqdm import tqdm
 import torch
 from torch.utils.data import random_split, DataLoader
+from model_registry import register_model_primitives
 import os
 import numpy as np
 import time
@@ -27,11 +28,17 @@ import sys
 
 # User-configurable options
 COLOR_MODE = "rgb"  # "rgb" or "gray"
-DATASET = "coco" # "voc" or "coco" or "aoi"
+DATASET = "voc" # "voc" or "coco" or "aoi"
 BASELINE_ONLY = False # run only the pretrained NN and exit
 RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi"
 randomSeeds = 12
 Run_title_SUFFIX = ""  # Optional suffix for run name
+
+# ---- Model Selection ----
+# Choose which NN models to include as primitives
+# Options: "deeplabv3_resnet50", "resnet18", "resnet50", "mobilenet_v3_small", "efficientnet_b0", "custom_aoi"
+MODELS_TO_USE = ["nadia_model"]  # Add/remove models here
+#MODELS_TO_USE = ["custom_aoi"]  # Add/remove models here
 
 # ---- Fitness Function Selection ----
 # Options: "dice" (binary), "miou" (multiclass IoU), "weighted_ce" (weighted cross-entropy)
@@ -44,21 +51,12 @@ SELECTED_CLASSES: list[int] | None = None
 # VOC: 15, 8, 12, 6, 19, 18
 # COCO 1, 67, 7, 65, 59, 22
 # AOI: 16, 31, 30, 24, 23
-SELECTED_CLASSES = [15, 8, 12]  # restrict classes 
+SELECTED_CLASSES = [15, 8, 12 ]  # restrict classes 
 
 # Optional: override the output number of classes, else len(SELECTED_CLASSES) or dataset default
 NUM_CLASSES_OVERRIDE: int | None = None
-
 # Default ignore index for excluded pixels
 DEFAULT_IGNORE_INDEX = 255
-
-CUSTOM_MODEL_PATH = "/dataB1/aoi/benchmarks/model_library/ensemble_models/v2/ensemble_model_1.pth"
-felgp_fs.set_custom_model(
-    path=CUSTOM_MODEL_PATH,
-    model_builder=None,      # full module -> no builder
-    normalize=True,          # set False if your model already handles normalization
-    eager_load=False         # set True to load immediately
-)
 
 # region ==== GP Setup ====
 
@@ -249,6 +247,8 @@ if BASELINE_ONLY:
 params = {
         "Dataset": dataSetName,
         "RUN_MODE": RUN_MODE,
+        "models_used": MODELS_TO_USE,
+        "fitness_function": FITNESS_FUNCTION,
         "randomSeeds": randomSeeds,
         "pop_size": pop_size,
         "generation": generation,
@@ -272,7 +272,7 @@ params["ignore_index"] = IGNORE_INDEX
 
 # endregion ==== GP Setup ====
 
-# region ==== GP function and terminal set definitions ====
+# region ==== GP Primitive and Terminal set definitions ====
 
 # Select input type based on color mode and desired output type
 _INPUT_TYPE = seg_types.RGBImage if COLOR_MODE == "rgb" else seg_types.GrayImage
@@ -297,9 +297,6 @@ pset.addPrimitive(tp("LogicalNot", felgp_fs.logical_not), [seg_types.FeatureMap]
 pset.addPrimitive(tp("LogicalOr", felgp_fs.logical_or), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalOr")
 pset.addPrimitive(tp("LogicalAnd", felgp_fs.logical_and), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalAnd")
 pset.addPrimitive(tp("LogicalXor", felgp_fs.logical_xor), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalXor")
-
-pset.addPrimitive(tp("Gt", felgp_fs.gt), [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Gt")
-pset.addPrimitive(tp("Lt", felgp_fs.lt), [seg_types.FeatureMap, float], seg_types.FeatureMap, name="Lt")
 pset.addPrimitive(tp("Normalize", felgp_fs.normalize), [seg_types.FeatureMap], seg_types.FeatureMap, name="Normalize")
 
 pset.addPrimitive(tp("SobelX", felgp_fs.sobel_x), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="SobelX")
@@ -307,30 +304,35 @@ pset.addPrimitive(tp("SobelY", felgp_fs.sobel_y), [seg_types.GrayImage] if COLOR
 pset.addPrimitive(tp("Laplacian", felgp_fs.laplacian), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="Laplacian")
 pset.addPrimitive(tp("GradientMagnitude", felgp_fs.gradient_magnitude), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="GradientMagnitude")
 
-# Combination functions
+# Combination primitives
 pset.addPrimitive(tp("Mix", felgp_fs.mix), [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="Mix")
 pset.addPrimitive(tp("IfElse", felgp_fs.if_then_else), [seg_types.FeatureMap, seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="IfElse")
 pset.addPrimitive(tp("Gauss", felgp_fs.gaussian_blur_param), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="Gauss")
 
-""" Pretrained segmentation NN and higher-level image->features (color-mode specific). """
-#pset.addPrimitive(tp("NNsegmenter", felgp_fs.pretrained_seg_nn), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="NNsegmenter")
+# NN model primitives
+register_model_primitives(pset, MODELS_TO_USE, COLOR_MODE, RUN_MODE)
 if RUN_MODE == "aoi":
     pset.addPrimitive(tp("aoiModel", felgp_fs.custom_model_infer), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="aoiModel")
-pset.addPrimitive(tp("NNFeatExt", felgp_fs.nn_feature_extractor), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="NNFeatExt")
 pset.addPrimitive(tp("EdgeFilter", felgp_fs.apply_depthwise_edge), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="EdgeFilter")
-pset.addPrimitive(tp("ImageToFeat", felgp_fs.image_to_featuremap), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="ImageToFeat")
-pset.addPrimitive(tp("ASPPCached", felgp_fs.apply_aspp_cached), [seg_types.FeatureMap, float], seg_types.FeatureMap, name="ASPPCached")
-pset.addPrimitive(tp("MNV3Small", felgp_fs.mobilenet_v3_small_feats), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="MNV3Small")
-pset.addPrimitive(tp("ShuffleV2", felgp_fs.shufflenet_v2_x1_0_feats), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="ShuffleV2")
-pset.addPrimitive(tp("ResNet18F", felgp_fs.resnet18_feats), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="ResNet18F")
 
-
+# Output conversion primitives
 if NUM_CLASSES == 1:
     pset.addPrimitive(tp("FeatToMask", felgp_fs.apply_feature_to_mask_cached), [seg_types.FeatureMap, float], seg_types.Mask, name="FeatToMask")
 elif NUM_CLASSES > 1:
     # Map intermediate FeatureMap -> k-class logits
     pset.addPrimitive(tp("FeatToLogits", lambda x: felgp_fs.feature_to_logits(x, NUM_CLASSES)),
                       [seg_types.FeatureMap], seg_types.FeatureMap, name="FeatToLogits")
+    
+#Terminals
+# Float thresholds for Gt/Lt (use a named function for multiprocessing pickling)
+def rand_thresh():
+    return float(np.random.uniform(0.05, 0.95))
+pset.addEphemeralConstant('Thresh', rand_thresh, float)
+def rand_channel():
+    return float(np.random.choice([8,16,32,64,128]))
+pset.addEphemeralConstant('Ch', rand_channel, float)
+def rand_alpha(): return float(np.random.uniform(0.0, 1.0))
+pset.addEphemeralConstant('Alpha', rand_alpha, float)
 
 # Collect available primitives (name and typed signature) for run info
 AVAILABLE_PRIMITIVES = _enumerate_primitives(pset)
@@ -346,19 +348,7 @@ try:
 except Exception:
     pass
 
-
-#Terminals
-# Float thresholds for Gt/Lt (use a named function for multiprocessing pickling)
-def rand_thresh():
-    return float(np.random.uniform(0.05, 0.95))
-pset.addEphemeralConstant('Thresh', rand_thresh, float)
-def rand_channel():
-    return float(np.random.choice([8,16,32,64,128]))
-pset.addEphemeralConstant('Ch', rand_channel, float)
-def rand_alpha(): return float(np.random.uniform(0.0, 1.0))
-pset.addEphemeralConstant('Alpha', rand_alpha, float)
-
-##
+# Define DEAP GP individual and fitness
 creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMax) # type: ignore
 

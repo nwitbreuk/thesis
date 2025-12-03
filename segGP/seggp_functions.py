@@ -2,10 +2,15 @@ import torch
 import torch.nn.functional as F   # <-- this defines F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'   # <-- this defines device
 from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
-from typing import Any, Callable, List
+from typing import Any, Callable
 from collections import OrderedDict
 import math
 import torch.nn as nn
+import torch
+import torch.nn.functional as F
+import os
+
+# region ==== Alignment & Helpers functions ====
 
 def _fmt_arg(a: Any) -> str:
     try:
@@ -25,8 +30,6 @@ def trace_primitive(name: str, fn: Callable) -> Callable:
     _wrapped.__name__ = f"traced_{name}"
     return _wrapped
 
-
-# Helpers
 def _as_nchw(x: torch.Tensor) -> torch.Tensor:
     # Accept (H,W), (C,H,W) or (B,C,H,W); return (B,C,H,W)
     if x.dim() == 2:
@@ -44,8 +47,6 @@ def _restore_like(y: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     if like.dim() == 3:      # (C,H,W)
         return y.squeeze(0)
     return y   
-
-# region ==== Combination & alignment Helpers ====
 
 def _project_channels_cached(x: torch.Tensor, out_ch: int) -> torch.Tensor:
     """Project tensor channels to `out_ch` via a cached 1x1 conv (deterministic init, inference-only).
@@ -86,44 +87,49 @@ def _repeat_channels(x: torch.Tensor, target_c: int) -> torch.Tensor:
     # fallback to projection when C>1 and unequal
     return _project_channels_cached(x, target_c)
 
-def _align_spatial(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resize tensors to the same (H,W). Chooses the larger area as target to preserve detail."""
-    ain, bin = a, b
-    a4 = _as_nchw(a)
-    b4 = _as_nchw(b)
-    Ha, Wa = a4.shape[-2:]
-    Hb, Wb = b4.shape[-2:]
-    if (Ha, Wa) == (Hb, Wb):
-        return a, b
-    # pick target: larger area
-    target = (Ha, Wa) if (Ha * Wa) >= (Hb * Wb) else (Hb, Wb)
-    a_res = F.interpolate(a4, size=target, mode='bilinear', align_corners=False)
-    b_res = F.interpolate(b4, size=target, mode='bilinear', align_corners=False)
-    return _restore_like(a_res, ain), _restore_like(b_res, bin)
-
 def _align_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Align two tensors on channel dimension for safe elementwise ops.
+    """Align two tensors on channel AND spatial dimensions for safe elementwise ops.
     Rules:
-      - If channels equal: passthrough
-      - If one is single-channel: repeat to the other's channels
-      - Else: project both down to min(Ca, Cb) using cached 1x1 conv
+      - Align channels first (repeat single-channel or project to common size)
+      - Then align spatial dimensions (interpolate to common H,W)
     """
     ain, bin = a, b
     a4 = _as_nchw(a)
     b4 = _as_nchw(b)
     Ca = a4.shape[1]
     Cb = b4.shape[1]
-    if Ca == Cb:
-        return a, b
-    if Ca == 1 and Cb > 1:
-        return _repeat_channels(a, Cb), b
-    if Cb == 1 and Ca > 1:
-        return a, _repeat_channels(b, Ca)
-    # project both to the smaller channel count to reduce cost
-    target = min(Ca, Cb)
-    a_al = _project_channels_cached(a, target)
-    b_al = _project_channels_cached(b, target)
-    return a_al, b_al
+    Ha, Wa = a4.shape[2], a4.shape[3]
+    Hb, Wb = b4.shape[2], b4.shape[3]
+    
+    # Step 1: Align channels
+    if Ca != Cb:
+        if Ca == 1 and Cb > 1:
+            a4 = a4.repeat(1, Cb, 1, 1)
+            Ca = Cb
+        elif Cb == 1 and Ca > 1:
+            b4 = b4.repeat(1, Ca, 1, 1)
+            Cb = Ca
+        else:
+            # project both to the smaller channel count to reduce cost
+            target = min(Ca, Cb)
+            a4 = _project_channels_cached(a4, target)
+            b4 = _project_channels_cached(b4, target)
+    
+    # Step 2: Align spatial dimensions - use the EXACT size from tensor 'a' as reference
+    # This ensures deterministic alignment in nested operations like IfElse
+    if (Ha, Wa) != (Hb, Wb):
+        # Always align b to match a's spatial size
+        b4 = F.interpolate(b4, size=(Ha, Wa), mode='bilinear', align_corners=False)
+    
+    # Restore original dimensionality (2D/3D/4D)
+    a_aligned = _restore_like(a4, ain)
+    b_aligned = _restore_like(b4, bin)
+    
+    return a_aligned, b_aligned
+
+# endregion
+
+# region ==== Combination functions ====
 
 def mix(x, y, w: float):
     """Convex combination of two tensors with automatic channel alignment."""
@@ -155,6 +161,7 @@ def gaussian_blur_param(x, sigma: float):
     return _restore_like(y, xin)
 
 # endregion
+
 # region ==== Basic Math operators (channel-safe) ====
 
 def add(x, y):
@@ -180,8 +187,6 @@ def sigmoid(x): return torch.sigmoid(x)
 def tanh_f(x): return torch.tanh(x)
 
 # comparison and thresholding functions
-def gt(x, t): return (x > t).float()
-def lt(x, t): return (x < t).float()
 def _restore_shape(y: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     # Return to 2D/3D if input was 2D/3D
     if like.dim() == 2:      # (H,W)
@@ -217,20 +222,9 @@ def logical_xor(x, y):
     xa, ya = _align_pair(x, y)
     return torch.abs(xa - ya)
 
-
-
 # endregion
 
 # region ==== NN primitives ====
-
-def conv_block(in_channels, out_channels, kernel_size=3, stride=1, norm=True, activation=True):
-    """Simple conv -> (BN) -> (ReLU) block. Returns an nn.Sequential module."""
-    layers: List[nn.Module] = [nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=kernel_size//2, bias=not norm)]
-    if norm:
-        layers.append(nn.BatchNorm2d(out_channels))
-    if activation:
-        layers.append(nn.ReLU(inplace=True))
-    return nn.Sequential(*layers)
 
 # apply a fixed depthwise 3x3 kernel (stateless) -> behaves like a small conv filter
 def apply_depthwise_edge(x: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
@@ -250,70 +244,6 @@ def apply_depthwise_edge(x: torch.Tensor, strength: float = 1.0) -> torch.Tensor
 # apply a small learnable conv module cached per (in_channels,out_channels)
 _module_cache = OrderedDict()
 _MAX_CACHE_SIZE = 64
-
-# Small allowed set of channel choices to keep cache bounded and stable
-_ALLOWED_CH = (8, 16, 32, 64, 128)
-
-def _pick_channel(out_channels_f: float) -> int:
-    """Map a GP-proposed float to a nearby allowed channel count."""
-    try:
-        v = int(round(float(out_channels_f)))
-    except Exception:
-        v = _ALLOWED_CH[0]
-    return min(_ALLOWED_CH, key=lambda c: abs(c - v))
-def apply_conv_block_cached(x: torch.Tensor, out_channels_f: float) -> torch.Tensor:
-    """Apply a conv_block from input channels to out_channels (out_channels_f is float; cast to int).
-    We cache nn.Module instances per (in_ch, out_ch) to avoid recreating each call.
-    Modules are created on CPU then moved to input device when called.
-    Note: cached modules are initialized once; they are used in inference only (no training in your pipeline)."""
-    xin = x
-    x = _as_nchw(x)
-    B,C,H,W = x.shape
-    out_channels = _pick_channel(out_channels_f)
-    key = ("conv", C, out_channels, str(x.device))
-    mod = _module_cache.get(key)
-    if mod is None:
-        mod = conv_block(C, out_channels, kernel_size=3, stride=1, norm=True, activation=True)
-        # deterministic-ish initialization (per-process)
-        for p in mod.parameters():
-            if p.dim() > 1:
-                nn.init.kaiming_normal_(p)
-        _module_cache[key] = mod
-        _module_cache.move_to_end(key)
-        if len(_module_cache) > _MAX_CACHE_SIZE:
-            _module_cache.popitem(last=False)
-    # ensure module on same device/dtype
-    mod = mod.to(x.device).to(x.dtype)
-    y = mod(x)
-    return _restore_like(y, xin)
-
-def apply_aspp_cached(x: torch.Tensor, out_channels_f: float) -> torch.Tensor:
-    """Apply a cached ASPP module. out_channels_f -> int out channels for ASPP projection."""
-    xin = x
-    x = _as_nchw(x)
-    B,C,H,W = x.shape
-    out_channels = _pick_channel(out_channels_f)
-    key = ('aspp', C, out_channels, str(x.device))
-    mod = _module_cache.get(key)
-    if mod is None:
-        mod = ASPP(C, out_channels, rates=(1,6,12))   # reduce rates for speed
-        # Initialize weights
-        for p in mod.parameters():
-            if p.dim() > 1:
-                nn.init.kaiming_normal_(p)
-        # Use eval() to avoid BatchNorm complaining about batch-size=1 (GP often runs per-image)
-        mod.eval()
-        _module_cache[key] = mod
-        _module_cache.move_to_end(key)
-        if len(_module_cache) > _MAX_CACHE_SIZE:
-            _module_cache.popitem(last=False)
-    else:
-        # Ensure in eval mode even when fetched from cache
-        mod.eval()
-    mod = mod.to(x.device).to(x.dtype)
-    y = mod(x)
-    return _restore_like(y, xin)
-
 
 def apply_feature_to_mask_cached(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     """Map a feature-map tensor to single-channel logits (Mask). `scale` can modulate output magnitude.
@@ -358,110 +288,6 @@ def feature_to_logits(x: torch.Tensor, k: int) -> torch.Tensor:
     mod = mod.to(x4.device).to(x4.dtype)
     y = mod(x4)
     return _restore_like(y, xin)
-
-
-def ensure_rgb(x: torch.Tensor) -> torch.Tensor:
-    """Ensure the tensor is RGB-like (3 channels). If single-channel, replicate; if >3, take first 3."""
-    xin = x
-    x = _as_nchw(x)
-    if x.shape[1] == 3:
-        return _restore_like(x, xin)
-    if x.shape[1] == 1:
-        return _restore_like(x.repeat(1,3,1,1), xin)
-    # if more than 3 channels, truncate
-    return _restore_like(x[:, :3, :, :], xin)
-
-
-def rgb_to_gray(x: torch.Tensor) -> torch.Tensor:
-    """Convert RGB to single-channel gray using a simple luminosity rule."""
-    xin = x
-    x = _as_nchw(x)
-    if x.shape[1] >= 3:
-        r,g,b = x[:,0:1], x[:,1:2], x[:,2:3]
-        y = 0.2989 * r + 0.5870 * g + 0.1140 * b
-    else:
-        y = x.mean(dim=1, keepdim=True)
-    return _restore_like(y, xin)
-
-
-def image_to_featuremap(x: torch.Tensor, ch_f: float) -> torch.Tensor:
-    """High-level wrapper: ensure RGB, then apply cached conv_block to produce a feature map.
-
-    Signature: (RGBImage, float) -> FeatureMap
-    """
-    xin = x
-    x = ensure_rgb(x)
-    return apply_conv_block_cached(x, ch_f)
-class ASPP(nn.Module):
-    """Lightweight Atrous Spatial Pyramid Pooling (ASPP)-like module.
-
-    Usage: aspp = ASPP(in_channels, out_channels); y = aspp(x)
-    """
-    def __init__(self, in_channels, out_channels, rates=(1, 6, 12, 18)):
-        super().__init__()
-        self.rate_convs = nn.ModuleList()
-        for r in rates:
-            if r == 1:
-                # 1x1 conv
-                self.rate_convs.append(nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(out_channels),
-                    nn.ReLU(inplace=True),
-                ))
-            else:
-                self.rate_convs.append(nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=r, dilation=r, bias=False),
-                    nn.BatchNorm2d(out_channels),
-                    nn.ReLU(inplace=True),
-                ))
-
-        # global pooling branch
-        self.global_pool = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-        self.project = nn.Sequential(
-            nn.Conv2d((len(rates) + 1) * out_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        res = []
-        for conv in self.rate_convs:
-            res.append(conv(x))
-        gp = self.global_pool(x)
-        gp = F.interpolate(gp, size=res[0].shape[2:], mode='bilinear', align_corners=False)
-        res.append(gp)
-        cat = torch.cat(res, dim=1)
-        return self.project(cat)
-
-def simple_mlp(input_dim, hidden_dims, output_dim, activation=nn.ReLU):
-    """Return a simple MLP (nn.Sequential) with given hidden dims.
-
-    Example: simple_mlp(512, [256,128], 10)
-    """
-    layers = []
-    last = input_dim
-    for h in hidden_dims:
-        layers.append(nn.Linear(last, h))
-        layers.append(activation())
-        last = h
-    layers.append(nn.Linear(last, output_dim))
-    return nn.Sequential(*layers)
-
-def simple_fcn(in_channels, num_classes):
-    """A 1x1 classifier conv producing raw logits for segmentation classes."""
-    return nn.Conv2d(in_channels, num_classes, kernel_size=1)
-
-def parameter_count(model: nn.Module):
-    """Return (total_params, trainable_params) as integers for the given model."""
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return int(total), int(trainable)
 
 # endregion ==== Model Utilities ====
 
@@ -552,102 +378,97 @@ def nn_feature_extractor(x: torch.Tensor) -> torch.Tensor:
     feats = mod(out)
     return _restore_like(feats, xin)
 
+_FEATURE_EXTRACTORS: dict[str, nn.Module] = {}
 
-
-# ...existing code...
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import os
-from torchvision.models import (
-    mobilenet_v3_small, MobileNet_V3_Small_Weights,
-    shufflenet_v2_x1_0, ShuffleNet_V2_X1_0_Weights,
-    resnet18, ResNet18_Weights,
-)
-
-_TV_FEAT: dict[str, torch.nn.Module] = {}
-
-def _get_tv_feats(key: str, builder, weights):
-    m = _TV_FEAT.get(key)
-    if m is not None:
-        return m
-    base = builder(weights=weights).to(device).eval()
-    for p in base.parameters():
-        p.requires_grad_(False)
-    if "resnet18" in key:
-        feat = torch.nn.Sequential(*(list(base.children())[:-2]))  # until layer4
-    elif "shuffle_v2_x1_0" in key:
-        # ShuffleNetV2 does not have .features; build a feature graph
-        # Modules: conv1, maxpool, stage2, stage3, stage4, conv5, fc
-        feat = torch.nn.Sequential(
-            base.conv1,
-            base.maxpool,
-            base.stage2,
-            base.stage3,
-            base.stage4,
-            base.conv5,
-        )
+@torch.no_grad()
+def _extract_features_from_model(model: nn.Module, x: torch.Tensor, cache_key: str | None = None) -> torch.Tensor:
+    """
+    Extract intermediate feature maps from a pretrained model.
+    
+    Args:
+        model: Pretrained PyTorch model
+        x: Input tensor
+        cache_key: Optional key to cache the feature extractor
+    
+    Returns:
+        Feature map tensor (B,32,H,W)
+    """
+    xin = x
+    x = _ensure_rgb_norm(x)
+    
+    # Check cache if key provided
+    if cache_key and cache_key in _FEATURE_EXTRACTORS:
+        feat = _FEATURE_EXTRACTORS[cache_key]
     else:
-        # MobileNetV3 has .features
-        feat = base.features
-    _TV_FEAT[key] = feat.to(device)
-    return _TV_FEAT[key]
+        # Build feature extractor (same logic as before)
+        model_name = model.__class__.__name__.lower()
+        
+        if 'resnet' in model_name:
+            feat = nn.Sequential(*list(model.children())[:-2])
+        elif 'mobilenet' in model_name:
+            feat = model.features
+        elif 'efficientnet' in model_name:
+            feat = model.features
+        elif 'shufflenet' in model_name:
+            feat = nn.Sequential(
+                model.conv1, model.maxpool, model.stage2, # type: ignore
+                model.stage3, model.stage4, # type: ignore
+                model.conv5 if hasattr(model, 'conv5') else nn.Identity() # type: ignore
+            )
+        elif 'deeplabv3' in model_name:
+            # DeepLabV3 backbone returns OrderedDict, wrap to extract the final feature map
+            backbone = model.backbone
+            def wrapped_backbone(x):
+                feats = backbone(x) # type: ignore
+                # feats is OrderedDict with keys like 'out', 'aux', or stage names
+                # Return the highest-resolution feature map (usually 'out' or last entry)
+                if isinstance(feats, dict):
+                    if 'out' in feats:
+                        return feats['out']
+                    # Fallback: return last value in OrderedDict
+                    return list(feats.values())[-1]
+                return feats
+            feat = wrapped_backbone
+        else:
+            feat = getattr(model, 'features', model)
+        
+        feat = feat.eval() if hasattr(feat, 'eval') else feat # type: ignore
+        if hasattr(feat, 'parameters'):
+            for p in feat.parameters(): # type: ignore
+                p.requires_grad_(False)
+
+        # Cache it
+        if cache_key:
+            _FEATURE_EXTRACTORS[cache_key] = feat # type: ignore
+    
+    # Execute feature extraction
+    if callable(feat):
+        y = feat(x)
+    else:
+        y = feat(x) # type: ignore
+    
+    # Handle OrderedDict output (shouldn't happen after wrapping, but safety check)
+    if isinstance(y, dict):
+        if 'out' in y:
+            y = y['out']
+        else:
+            y = list(y.values())[-1]
+    
+    y = _project_channels_cached(y, 32) # type: ignore
+    y = F.interpolate(y, size=_as_nchw(xin).shape[-2:], mode='bilinear', align_corners=False)
+    
+    return _restore_like(y, xin)
+
 
 @torch.no_grad()
 def _ensure_rgb_norm(x: torch.Tensor) -> torch.Tensor:
+    """Ensure input tensor is 3-channel RGB and normalized."""
     x = _as_nchw(x).to(device)
     if x.shape[1] == 1:
         x = x.repeat(1, 3, 1, 1)
     elif x.shape[1] > 3:
         x = x[:, :3]
     return (x - _MEAN) / _STD
-
-@torch.no_grad()
-def mobilenet_v3_small_feats(x: torch.Tensor) -> torch.Tensor:
-    xin = x
-    x = _ensure_rgb_norm(x)
-    feat = _get_tv_feats("mnv3_small", mobilenet_v3_small, MobileNet_V3_Small_Weights.DEFAULT)
-    y = feat(x)                                 # (B,Cs,H/?,W/?)
-    y = _project_channels_cached(y, 32)         # shrink channels
-    y = F.interpolate(y, size=x.shape[-2:], mode='bilinear', align_corners=False)
-    return _restore_like(y, xin)
-
-@torch.no_grad()
-def shufflenet_v2_x1_0_feats(x: torch.Tensor) -> torch.Tensor:
-    xin = x
-    x = _ensure_rgb_norm(x)
-    feat = _get_tv_feats("shuffle_v2_x1_0", shufflenet_v2_x1_0, ShuffleNet_V2_X1_0_Weights.DEFAULT)
-    y = feat(x)                                 # (B,Cs,H/?,W/?)
-    y = _project_channels_cached(y, 32)
-    # Align to input spatial size
-    y = F.interpolate(y, size=_as_nchw(xin).shape[-2:], mode='bilinear', align_corners=False)
-    return _restore_like(y, xin)
-
-@torch.no_grad()
-def resnet18_feats(x: torch.Tensor) -> torch.Tensor:
-    xin = x
-    x = _ensure_rgb_norm(x)
-    feat = _get_tv_feats("resnet18", resnet18, ResNet18_Weights.DEFAULT)
-    y = feat(x)                                 # (B,512,H/32,W/32)
-    y = _project_channels_cached(y, 32)
-    y = F.interpolate(y, size=x.shape[-2:], mode='bilinear', align_corners=False)
-    return _restore_like(y, xin)
-
-def nadia_model(x: torch.Tensor) -> torch.Tensor:
-    """NADIA model feature extractor placeholder.
-    Replace with actual implementation as needed.
-    """
-    xin = x
-    x = _ensure_rgb_norm(x)
-    # Simple conv block as placeholder
-    torch_model_path = '/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts'
-    torch_model_state = torch.load(torch_model_path, map_location=torch.device('cpu'), weights_only=False)
-    if isinstance(torch_model_state, dict) and 'model' in torch_model_state:
-        torch_model_state = torch_model_state['model']
-    
- 
-    return _restore_like(y, xin)
-
 
 # ----------------- Custom model loader / wrapper -----------------
 _CUSTOM_MODEL = None
@@ -690,7 +511,7 @@ def _load_custom_model():
     except Exception:
         pass
 
-    ckpt = torch.load(_CUSTOM_MODEL_PATH, map_location=device)
+    ckpt = torch.load(_CUSTOM_MODEL_PATH, map_location=device, weights_only=False)
     if isinstance(ckpt, nn.Module):
         _CUSTOM_MODEL = ckpt.eval().to(device)
         return _CUSTOM_MODEL
@@ -761,7 +582,6 @@ def custom_model_infer(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
 
 # region ==== Filtering & edge detection Functions ====
 
-# Sobel and Laplacian filters
 sobel_x_kernel = torch.tensor([[-1, 0, 1],
                                [-2, 0, 2],
                                [-1, 0, 1]], dtype=torch.float32, device=device)
@@ -790,25 +610,8 @@ def laplacian(x): return _depthwise_conv(x, laplacian_kernel, pad=1)
 def gradient_magnitude(x):
     gx, gy = sobel_x(x), sobel_y(x)
     return torch.sqrt(gx * gx + gy * gy + 1e-12)
-# endregion
-
-# region ==== Pretrained feature combinators ====
-
-def combine_pre_feat(pre_feats: torch.Tensor, fmap: torch.Tensor, w: float) -> torch.Tensor:
-    """
-    Combine pretrained features with another feature map using a convex mix after channel alignment.
-
-    Args:
-        pre_feats: tensor-like features produced by pretrained_seg_nn (any shape convertible to NCHW)
-        fmap: tensor-like regular feature map
-        w: mixing coefficient in [0,1]; output = w * A + (1-w) * B
-
-    Returns: Feature map tensor aligned to input spatial dims.
-    """
-    # Reuse existing helpers to align and mix safely
-    # mix(x, y, w) already aligns channels and returns x*w + y*(1-w)
-    return mix(pre_feats, fmap, float(max(0.0, min(1.0, w))))
 
 # endregion
+
 
 
