@@ -1,6 +1,7 @@
 import operator
 import argparse
 import random
+from tqdm import tqdm
 import torch
 from torch.utils.data import random_split, DataLoader
 import os
@@ -28,9 +29,13 @@ import sys
 COLOR_MODE = "rgb"  # "rgb" or "gray"
 DATASET = "coco" # "voc" or "coco" or "aoi"
 BASELINE_ONLY = False # run only the pretrained NN and exit
-RUN_MODE = "normal"  # "fast", "middle", "normal" or "aoi"
+RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi"
 randomSeeds = 12
 Run_title_SUFFIX = ""  # Optional suffix for run name
+
+# ---- Fitness Function Selection ----
+# Options: "dice" (binary), "miou" (multiclass IoU), "weighted_ce" (weighted cross-entropy)
+FITNESS_FUNCTION = "miou"  # Change to "weighted_ce" to enable weighted loss
 
 # ---- Class selection (static config, no CLI) ----
 # Set to a list of dataset label IDs to include. Example for COCO/VOC: [2,5,17]
@@ -39,7 +44,7 @@ SELECTED_CLASSES: list[int] | None = None
 # VOC: 15, 8, 12, 6, 19, 18
 # COCO 1, 67, 7, 65, 59, 22
 # AOI: 16, 31, 30, 24, 23
-SELECTED_CLASSES = [65, 67, 7]  # restrict classes 
+SELECTED_CLASSES = [15, 8, 12]  # restrict classes 
 
 # Optional: override the output number of classes, else len(SELECTED_CLASSES) or dataset default
 NUM_CLASSES_OVERRIDE: int | None = None
@@ -87,8 +92,8 @@ if DATASET == 'voc':
     mask_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_train_val/VOC2012_train_val/SegmentationClass"
 elif DATASET == 'coco':
     dataSetName = 'COCO'
-    image_dir = "/dataB1/niels_witbreuk/data/coco/images"
-    mask_dir = "/dataB1/niels_witbreuk/data/coco/masks"
+    image_dir = "/dataB1/niels_witbreuk/data/coco/images+"
+    mask_dir = "/dataB1/niels_witbreuk/data/coco/masks+"
 elif DATASET == 'aoi':
     dataSetName = 'aoi'
     image_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/test/img"
@@ -133,7 +138,7 @@ RUN_NAME = data_handling.make_run_name(
 # Presets per mode
 _PRESETS = {
     "aoi":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 1, "cap_train": 10,  "cap_test": 5},
-    "fast":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 4, "cap_train": 80,  "cap_test": 32},
+    "fast":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 1, "cap_train": 80,  "cap_test": 32},
     "middle": {"pop_size": 25, "generation": 15, "initialMaxDepth": 7, "maxDepth": 7,  "batch_size": 6, "cap_train": 200, "cap_test": 80},
     "normal": {"pop_size": 50, "generation": 30, "initialMaxDepth": 8, "maxDepth": 8,  "batch_size": 8, "cap_train": 400, "cap_test": 160},
 }
@@ -186,6 +191,28 @@ train_loader = DataLoader(train_dataset, batch_size=_MODE_BATCH_SIZE,
 test_loader  = DataLoader(test_dataset, batch_size=_MODE_BATCH_SIZE,
                           shuffle=False, collate_fn=pad_collate,
                           num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
+
+# --- Calculate class weights for weighted loss ---
+# Calculate weights ONLY if using weighted loss
+def calculate_class_weights(loader, num_classes, ignore_idx):
+        print("Calculating class weights for weighted loss...")
+        counts = torch.zeros(num_classes, device=device)
+        for _, masks in tqdm(loader, desc="Counting classes", leave=False, disable=True):
+            masks = masks.to(device)
+            for i in range(num_classes):
+                if i == ignore_idx: continue
+                counts[i] += (masks == i).sum()
+        total_valid_pixels = counts.sum()
+        class_weights = total_valid_pixels / (counts + 1e-6)
+        class_weights = class_weights / class_weights.sum() * num_classes
+        print(f"Calculated weights: {class_weights.cpu().numpy()}")
+        return class_weights.float()
+
+class_weights = None
+if FITNESS_FUNCTION == "weighted_ce" and NUM_CLASSES > 1:
+    class_weights = calculate_class_weights(train_loader, NUM_CLASSES, IGNORE_INDEX)
+else:
+    class_weights = None
 
 # Optional: run only the pretrained baseline and exit early
 if BASELINE_ONLY:
@@ -432,41 +459,56 @@ def _multiclass_preds(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch
     return preds, probs
 
 def evalTrain(toolbox, individual, hof):
-    """
-    Evaluate the GP individual on the training set.
-    Args:
-        toolbox: DEAP toolbox with compile method.
-        individual: The GP individual to evaluate.
-        hof: Hall of Fame individuals to reuse fitness if available.
-    Returns:
-        Tuple with mean Dice score (binary) or mean IoU (multiclass) on the training set.
-    """
     for h in (hof or []):
         if individual == h:
             return h.fitness.values
     try:
-        if NUM_CLASSES == 1:
-            func = toolbox.compile(expr=individual)
+        func = toolbox.compile(expr=individual)
+        
+        if FITNESS_FUNCTION == "weighted_ce" and NUM_CLASSES > 1:
+            # Weighted cross-entropy fitness
+            total_loss = 0.0
+            batch_count = 0
+            with torch.no_grad():
+                for imgs, masks in train_loader:
+                    imgs, masks = imgs.to(device), masks.to(device)
+                    logits = func(imgs)
+                    logits = _align_to_mask(logits, masks)
+                    logits = _ensure_k_channels(logits, NUM_CLASSES)
+                    
+                    logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, NUM_CLASSES)
+                    masks_flat = masks.view(-1).long()
+                    loss = F.cross_entropy(logits_flat, masks_flat, weight=class_weights, ignore_index=IGNORE_INDEX) # type: ignore
+                    
+                    if torch.isinf(loss) or torch.isnan(loss): continue
+                    total_loss += loss.item()
+                    batch_count += 1
+            
+            avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
+            return (-avg_loss,)  # Negative because DEAP maximizes
+        
+        elif NUM_CLASSES == 1:
+            # Binary Dice fitness
             inter_total = 0.0
             union_total = 0.0
             with torch.no_grad():
                 for imgs, masks in train_loader:
                     imgs, masks = imgs.to(device), masks.to(device)
-                    out = func(imgs)                            # compute first
-                    out = _align_to_mask(out, masks)           # then align
+                    out = func(imgs)
+                    out = _align_to_mask(out, masks)
                     preds, probs = _binarize_from_logits(out)
-                    #if preds.dim() == 4 and masks.dim() == 4 and preds.shape[-2:] != masks.shape[-2:]:
-                    #    preds = F.interpolate(preds, size=masks.shape[-2:], mode='nearest')
                     inter_total += float((preds * masks).sum().item())
                     union_total += float(preds.sum().item() + masks.sum().item())
             dice = (2.0 * inter_total / (union_total + 1e-6)) if union_total > 0 else 0.0
             return (dice,)
         else:
+            # Standard mIoU fitness
             _, miou = eval_dataset_miou(toolbox, individual, train_loader, NUM_CLASSES, device=device, ignore_index=IGNORE_INDEX)
             return (miou,)
+    
     except Exception as e:
         print("Evaluation error (train):", e)
-        return (0.0,)
+        return (float('-inf'),) if FITNESS_FUNCTION == "weighted_ce" else (0.0,)
 
 
 toolbox.register("evaluate", evalTrain,toolbox)
