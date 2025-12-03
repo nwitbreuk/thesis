@@ -136,8 +136,18 @@ def visualize_predictions(toolbox, individual, dataset, num_samples=3, threshold
             # Get the raw prediction indices (0 to k-1)
             pred_indices = pred.squeeze(0).squeeze(0)
             
-            # Get the ground truth mask and find where the ignore_index is
-            gt_mask_for_ignore = mask_t.squeeze(0) if mask_t.dim()==3 else mask_t
+            # Get the ground truth mask
+            gt_mask_for_ignore = mask_t.squeeze(0) if mask_t.dim()==3 else mask_t  # (H_gt, W_gt)
+            
+            # --- FIX: Align prediction to ground truth spatial size ---
+            if pred_indices.shape != gt_mask_for_ignore.shape:
+                pred_indices = torch.nn.functional.interpolate(
+                    pred_indices.unsqueeze(0).unsqueeze(0).float(),
+                    size=gt_mask_for_ignore.shape,
+                    mode='nearest'
+                ).squeeze(0).squeeze(0).long()
+            
+            # Now find where the ignore_index is
             ignore_pixels = (gt_mask_for_ignore == 255)
 
             # Create a new prediction mask where ignored pixels are set to 255

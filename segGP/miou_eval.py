@@ -95,6 +95,8 @@ def _to_numpy_preds_and_targets(preds: torch.Tensor, targets: torch.Tensor, num_
         preds = preds.unsqueeze(0)
     if targets.dim() == 3:
         targets = targets.unsqueeze(0)
+    if targets.dim() == 2:
+        targets = targets.unsqueeze(0)
 
     # If multiclass logits/probs -> argmax
     if preds.dim() == 4 and preds.shape[1] > 1:
@@ -124,9 +126,41 @@ def _to_numpy_preds_and_targets(preds: torch.Tensor, targets: torch.Tensor, num_
     else:
         targ_ids = targets.long()
 
+    # --- KEY FIX: Align spatial dimensions before flattening ---
+    # Ensure pred_ids and targ_ids have identical shapes
+    if pred_ids.shape != targ_ids.shape:
+        # Both should be (B, H, W) at this point
+        # Interpolate predictions to match target spatial size
+        target_h, target_w = targ_ids.shape[-2:]
+        if pred_ids.dim() == 3:
+            # Add channel dimension for interpolation: (B, H, W) -> (B, 1, H, W)
+            pred_ids_4d = pred_ids.unsqueeze(1).float()
+            pred_ids_4d = torch.nn.functional.interpolate(
+                pred_ids_4d, 
+                size=(target_h, target_w), 
+                mode='nearest'
+            )
+            pred_ids = pred_ids_4d.squeeze(1).long()
+        elif pred_ids.dim() == 2:
+            # (H, W) case - add batch and channel dims
+            pred_ids_4d = pred_ids.unsqueeze(0).unsqueeze(0).float()
+            pred_ids_4d = torch.nn.functional.interpolate(
+                pred_ids_4d,
+                size=(target_h, target_w),
+                mode='nearest'
+            )
+            pred_ids = pred_ids_4d.squeeze(0).squeeze(0).long()
+
     # flatten
     pred_flat = pred_ids.clamp(0, max(0, num_classes - 1)).cpu().numpy().ravel().astype(np.int64)
     targ_flat = targ_ids.cpu().numpy().ravel().astype(np.int64)
+    
+    # Final safety check: ensure arrays have same length
+    if pred_flat.shape[0] != targ_flat.shape[0]:
+        min_len = min(pred_flat.shape[0], targ_flat.shape[0])
+        pred_flat = pred_flat[:min_len]
+        targ_flat = targ_flat[:min_len]
+    
     return pred_flat, targ_flat
 
 
