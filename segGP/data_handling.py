@@ -69,7 +69,7 @@ def make_run_name(dataset_name: str,
     base = f"{dataset_name}_{run_mode}mode_seed{seed}_{{jid}}_-{color_mode}-classes{SELECTED_CLASSES}{suffix}"
     
     if baseline_only:
-        return f"{base}-NN-only"
+        return f"{base}-Baseline-only"
     return base
 
 def _make_run_dir(args, dataset_name, seed):

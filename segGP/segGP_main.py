@@ -4,6 +4,7 @@ import random
 from tqdm import tqdm
 import torch
 from torch.utils.data import random_split, DataLoader
+from algo_iegp import run_baselines_for_models
 from model_registry import register_model_primitives
 import os
 import numpy as np
@@ -29,15 +30,15 @@ import sys
 # User-configurable options
 COLOR_MODE = "rgb"  # "rgb" or "gray"
 DATASET = "voc" # "voc" or "coco" or "aoi"
-BASELINE_ONLY = False # run only the pretrained NN and exit
-RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi"
+BASELINE_ONLY = True # run only the pretrained NN and exit
+RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi_fast", "aoi_normal"
 randomSeeds = 12
 Run_title_SUFFIX = ""  # Optional suffix for run name
 
 # ---- Model Selection ----
 # Choose which NN models to include as primitives
 # Options: "deeplabv3_resnet50", "resnet18", "resnet50", "mobilenet_v3_small", "efficientnet_b0", "custom_aoi"
-MODELS_TO_USE = ["nadia_model"]  # Add/remove models here
+MODELS_TO_USE = ["nadia_model", "resnet18", "mobilenet_v3_small"]  # Add/remove models here
 #MODELS_TO_USE = ["custom_aoi"]  # Add/remove models here
 
 # ---- Fitness Function Selection ----
@@ -135,7 +136,8 @@ RUN_NAME = data_handling.make_run_name(
 
 # Presets per mode
 _PRESETS = {
-    "aoi":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 1, "cap_train": 10,  "cap_test": 5},
+    "aoi_fast":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 1, "cap_train": 10,  "cap_test": 5},
+    "aoi_normal": {"pop_size": 50, "generation": 30, "initialMaxDepth": 8, "maxDepth": 8,  "batch_size": 1, "cap_train": 10, "cap_test": 5},
     "fast":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 1, "cap_train": 80,  "cap_test": 32},
     "middle": {"pop_size": 25, "generation": 15, "initialMaxDepth": 7, "maxDepth": 7,  "batch_size": 6, "cap_train": 200, "cap_test": 80},
     "normal": {"pop_size": 50, "generation": 30, "initialMaxDepth": 8, "maxDepth": 8,  "batch_size": 8, "cap_train": 400, "cap_test": 160},
@@ -212,33 +214,22 @@ if FITNESS_FUNCTION == "weighted_ce" and NUM_CLASSES > 1:
 else:
     class_weights = None
 
-# Optional: run only the pretrained baseline and exit early
 if BASELINE_ONLY:
-    print(f"[Baseline] Evaluating pretrained_seg_nn on dataset '{dataSetName}' (classes={NUM_CLASSES}, selected={SELECTED_CLASSES})...")
-    from types import SimpleNamespace
-    args_ns = SimpleNamespace(run_name=RUN_NAME, outdir=RUN_OUTDIR, no_git_check=False)
-    run_dir, meta = data_handling._make_run_dir(args_ns, dataSetName, randomSeeds)
-    data_handling._write_run_info(run_dir, meta, args_ns, randomSeeds)
-    # Perform baseline evaluation and save artifacts into run_dir
-    _ = run_pretrained_baseline(
+    print(f"[Baseline] Evaluating models {MODELS_TO_USE} on dataset '{dataSetName}' (classes={NUM_CLASSES}, selected={SELECTED_CLASSES})...")
+
+    _ = run_baselines_for_models(
+        models_to_use=MODELS_TO_USE,
         train_loader=train_loader,
         test_loader=test_loader,
         num_classes=NUM_CLASSES,
+        ignore_index=IGNORE_INDEX, # type: ignore
         device=device,
-        ignore_index=IGNORE_INDEX,
-        run_dir=run_dir,
         dataset_name=dataSetName,
+        selected_classes=SELECTED_CLASSES,
+        run_dir=RUN_OUTDIR,
+        run_name=RUN_NAME,
+        run_mode=RUN_MODE,
         randomSeeds=randomSeeds,
-        params={
-            "Dataset": dataSetName,
-            "RUN_MODE": RUN_MODE,
-            "color_mode": COLOR_MODE,
-            "num_classes": NUM_CLASSES,
-            "selected_classes": SELECTED_CLASSES,
-        },
-        args=args_ns,
-        meta=meta,
-        copy_slurm_logs=True,
         save_visuals=True,
         vis_count=6,
     )

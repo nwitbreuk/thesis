@@ -3,14 +3,16 @@ from deap import tools
 from collections import defaultdict
 
 # Baseline evaluation imports
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Callable
 import os
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from typing import List
 
 import seggp_functions as felgp_fs
 from miou_eval import _accumulate_confmat, confmat_to_iou
+from miou_eval import _to_numpy_preds_and_targets  # ✅ import the safe converter
 
 
 def pop_compare(ind1, ind2):
@@ -189,29 +191,116 @@ def eaSimple(population, toolbox, cxpb, mutpb, elitpb, ngen, randomseed, stats=N
     return population, logbook
 
 
-# ===== Baseline: evaluate pretrained_seg_nn without GP =====
+# region ===== Baseline: evaluate pretrained_seg_nn without GP =====
+
+def build_segmenter_callable(model_name: str, num_classes: int):
+    """
+    Build a callable(x) -> logits (B,k,H,W) for baseline evaluation using the model registry.
+    """
+    from model_registry import make_segmenter, MODEL_CONFIGS
+    if model_name not in MODEL_CONFIGS:
+        raise ValueError(f"Unknown model '{model_name}'")
+    return make_segmenter(model_name, num_classes)
+
+def run_baselines_for_models(
+    models_to_use: List[str],
+    train_loader,
+    test_loader,
+    num_classes: int,
+    ignore_index: int,
+    device: str,
+    dataset_name: str,
+    selected_classes: List[int] | None,
+    run_dir: str,
+    run_name: str,
+    run_mode: str,
+    randomSeeds: int,
+    save_visuals: bool = True,
+    vis_count: int = 6,
+) -> dict:
+    """
+    Orchestrate baseline evaluation across multiple models.
+    Returns dict of model_name -> result dict.
+    """
+    from types import SimpleNamespace
+    import data_handling
+
+    args_ns = SimpleNamespace(run_name=run_name, outdir=run_dir, no_git_check=False)
+    run_root, meta = data_handling._make_run_dir(args_ns, dataset_name, randomSeeds)
+    data_handling._write_run_info(run_root, meta, args_ns, randomSeeds)
+
+    baseline_results: dict = {}
+    for idx, model_name in enumerate(models_to_use):
+        try:
+            print(f"\n[Baseline] Evaluating {model_name}...")
+            model_func = build_segmenter_callable(model_name, num_classes)
+            result = run_pretrained_baseline(
+                train_loader=train_loader,
+                test_loader=test_loader,
+                num_classes=num_classes,
+                model_func=model_func,
+                model_name=model_name,
+                device=device,
+                ignore_index=ignore_index,
+                run_dir=os.path.join(run_root, model_name),
+                dataset_name=dataset_name,
+                randomSeeds=randomSeeds,
+                params={
+                    "Dataset": dataset_name,
+                    "RUN_MODE": run_mode,
+                    "color_mode": "rgb",  # set by caller if needed
+                    "num_classes": num_classes,
+                    "selected_classes": selected_classes,
+                    "model_name": model_name,
+                },
+                args=args_ns,
+                meta=meta,
+                copy_slurm_logs=(idx == len(models_to_use) - 1),
+                save_visuals=save_visuals,
+                vis_count=vis_count,
+            )
+            baseline_results[model_name] = result
+        except Exception as e:
+            print(f"[Baseline] {model_name} failed: {e}")
+
+    # Save comparison summary
+    comparison_path = os.path.join(run_root, "baseline_comparison.txt")
+    with open(comparison_path, "w") as f:
+        f.write("=== BASELINE MODEL COMPARISON ===\n")
+        f.write(f"Dataset: {dataset_name}\n")
+        f.write(f"Classes: {num_classes} (selected: {selected_classes})\n")
+        f.write(f"Metric: {'mIoU' if num_classes > 1 else 'Dice'}\n\n")
+        for model_name, result in baseline_results.items():
+            f.write(f"{model_name}: Train {result['train']['mean']:.4f} | Test {result['test']['mean']:.4f}\n")
+    print(f"\n[Baseline] Comparison saved to {comparison_path}")
+
+    return {"results": baseline_results, "run_root": run_root, "meta": meta}
+
 @torch.no_grad()
 def eval_pretrained_on_loader(
     data_loader,
     num_classes: int,
+    model_func: Callable,
     device: Optional[str] = None,
     ignore_index: Optional[int] = 255,
     max_batches: Optional[int] = None,
 ) -> Tuple[np.ndarray, float]:
-    """Evaluate DeepLabV3 baseline directly on a DataLoader.
-
-    - For multiclass (num_classes>1): returns (per_class_ious, mIoU).
-    - For binary (num_classes==1): returns (np.array([dice]), dice).
+    """Evaluate a model function directly on a DataLoader.
 
     Args:
-      data_loader: yields (images, masks). Images (B,C,H,W), masks (B,1,H,W) long for multiclass or float for binary.
-      num_classes: number of classes including background (use 21 for VOC).
-      device: 'cuda' or 'cpu'. Defaults to CUDA if available.
-      ignore_index: label to ignore for multiclass (e.g., 255 for VOC).
-    max_batches: optional limit for quick tests.
+      data_loader: yields (images, masks)
+      num_classes: number of classes including background
+      model_func: callable that takes images and returns logits (e.g., compiled GP individual or NN model)
+      device: 'cuda' or 'cpu'
+      ignore_index: label to ignore for multiclass
+      max_batches: optional limit for quick tests
+    
+    Returns:
+      (per_class_ious, mean_iou) for multiclass, or (np.array([dice]), dice) for binary
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    num_classes = int(num_classes)
 
     if num_classes > 1:
         conf = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -223,49 +312,24 @@ def eval_pretrained_on_loader(
 
     for imgs, masks in data_loader:
         imgs = imgs.to(device)
-        # masks shape: (B,1,H,W); long for multiclass, float for binary
-        # Use original dtype for comparisons below
-        with torch.no_grad():
-            #if dataset = "aoi"
-            #    logits = felgp_fs.pretrained_seg_nn_aoi(imgs)  # (B,21,H,W)
-            #else:
-                logits = felgp_fs.pretrained_seg_nn(imgs)  # (B,21,H,W)
+        masks = masks.to(device)
+
+        logits = model_func(imgs)
+
+        # --- Robust conversion and alignment using shared helper ---
+        pred_flat, targ_flat = _to_numpy_preds_and_targets(
+            logits, masks, num_classes=num_classes, ignore_index=ignore_index
+        )
 
         if num_classes > 1:
-            pred_ids = logits.argmax(dim=1)  # (B,H,W)
-            # target ids: squeeze channel if present
-            targ_ids = masks
-            if targ_ids.dim() == 4 and targ_ids.shape[1] == 1:
-                targ_ids = targ_ids.squeeze(1)
-            targ_ids = targ_ids.to(torch.long)
-
-            # Flatten and accumulate confusion matrix with ignore handling
-            p_np = pred_ids.view(-1).cpu().numpy().astype(np.int64)
-            t_np = targ_ids.view(-1).cpu().numpy().astype(np.int64)
-            conf = _accumulate_confmat(conf, p_np, t_np, num_classes=num_classes, ignore_index=ignore_index)
+            conf = _accumulate_confmat(conf, pred_flat, targ_flat, num_classes=num_classes, ignore_index=ignore_index)
         else:
-            # Binary: reduce multi-channel logits to a single-channel score,
-            # apply sigmoid and threshold to obtain binary predictions.
-            # If logits have multiple channels, average them to form a single
-            # foreground score; if single-channel, use it directly.
-            if logits.dim() == 4 and logits.shape[1] > 1:
-                logits_bin = logits.mean(dim=1)  # (B,H,W)
-            elif logits.dim() == 4 and logits.shape[1] == 1:
-                logits_bin = logits.squeeze(1)   # (B,H,W)
-            else:
-                logits_bin = logits
-
-            probs = torch.sigmoid(logits_bin)
-            pred_bin = (probs > 0.5).to(torch.float32)
-
-            # target expected (B,1,H,W) or (B,H,W)
-            targ_bin = masks
-            if targ_bin.dim() == 4 and targ_bin.shape[1] == 1:
-                targ_bin = targ_bin.squeeze(1)
-            targ_bin = targ_bin.to(torch.float32)
-
-            inter = (pred_bin * targ_bin).sum().item() * 2.0
-            summ = (pred_bin + targ_bin).sum().item() + 1e-8
+            # Binary Dice (compute from arrays)
+            # pred_flat and targ_flat are 0/1 ints; convert to float arrays
+            p = pred_flat.astype(np.float32)
+            t = targ_flat.astype(np.float32)
+            inter = float((p * t).sum()) * 2.0
+            summ = float((p + t).sum()) + 1e-8
             total_inter += inter
             total_sum += summ
 
@@ -277,10 +341,7 @@ def eval_pretrained_on_loader(
         ious, miou = confmat_to_iou(conf, exclude_background=(num_classes > 1))
         return ious, miou
     else:
-        if total_sum > 0.0:
-            dice = float(total_inter) / float(total_sum)
-        else:
-            dice = 0.0
+        dice = float(total_inter) / float(total_sum) if total_sum > 0.0 else 0.0
         return np.array([dice], dtype=float), dice
 
 
@@ -288,10 +349,11 @@ def run_pretrained_baseline(
     train_loader,
     test_loader,
     num_classes: int,
+    model_func: Callable,
+    model_name: str = "model",
     device: Optional[str] = None,
     ignore_index: Optional[int] = 255,
     max_batches: Optional[int] = None,
-    # Saving/output integration params
     run_dir: Optional[str] = None,
     dataset_name: Optional[str] = None,
     randomSeeds: Optional[int] = None,
@@ -302,20 +364,19 @@ def run_pretrained_baseline(
     save_visuals: bool = True,
     vis_count: int = 6,
 ) -> Dict[str, Any]:
-    """Run baseline DeepLabV3 evaluation on train and test loaders.
-
-    Also saves outputs similar to GP runs when `run_dir` is provided:
-    - Writes a `Summary_on{Dataset}.txt` with metrics
-    - Saves a few prediction visualizations under `visualizations/`
-    - Copies Slurm logs into the run dir if `meta` is provided and `copy_slurm_logs=True`
+    """Run baseline model evaluation on train and test loaders.
+    
+    Args:
+        model_func: Callable that takes images and returns logits
+        model_name: Name of the model for logging purposes
     """
-    train_scores = eval_pretrained_on_loader(train_loader, num_classes, device, ignore_index, max_batches)
-    test_scores  = eval_pretrained_on_loader(test_loader,  num_classes, device, ignore_index, max_batches)
+    train_scores = eval_pretrained_on_loader(train_loader, num_classes, model_func, device, ignore_index, max_batches)
+    test_scores  = eval_pretrained_on_loader(test_loader,  num_classes, model_func, device, ignore_index, max_batches)
 
     train_per, train_mean = train_scores
     test_per,  test_mean  = test_scores
     metric_name = "mIoU" if num_classes > 1 else "Dice"
-    print(f"[Baseline pretrained_seg_nn] Train {metric_name}: {train_mean:.4f} | Test {metric_name}: {test_mean:.4f}")
+    print(f"[Baseline {model_name}] Train {metric_name}: {train_mean:.4f} | Test {metric_name}: {test_mean:.4f}")
 
     # Save artifacts if run_dir provided
     if run_dir:
@@ -327,7 +388,7 @@ def run_pretrained_baseline(
         ds_name = dataset_name or params.get("Dataset", "dataset") if params else (dataset_name or "dataset")
         summary_path = os.path.join(run_dir, f"Summary_on{ds_name}.txt")
         with open(summary_path, "w") as f:
-            f.write(f"Mode: NN Only (pretrained_seg_nn)\n")
+            f.write(f"Mode: Baseline ({model_name})\n")
             if params:
                 f.write(f"RUN_MODE: {params.get('RUN_MODE','n/a')}\n")
                 f.write(f"color_mode: {params.get('color_mode','n/a')}\n")
@@ -349,13 +410,11 @@ def run_pretrained_baseline(
             with torch.no_grad():
                 for imgs, masks in test_loader:
                     imgs = imgs.to(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-                    logits = felgp_fs.pretrained_seg_nn(imgs)
+                    logits = model_func(imgs)
                     if num_classes > 1:
                         preds = logits.argmax(dim=1, keepdim=True).float()
                         cmap = plt.get_cmap('tab20', max(2, num_classes))
                     else:
-                        # Binary: collapse multi-channel logits to a single-channel
-                        # score then sigmoid+threshold to obtain binary mask.
                         if logits.dim() == 4 and logits.shape[1] > 1:
                             logits_bin = logits.mean(dim=1, keepdim=True)
                         else:
@@ -397,7 +456,7 @@ def run_pretrained_baseline(
                         for ax in axs:
                             ax.axis('off')
                         fig.tight_layout()
-                        out_path = os.path.join(vis_dir, f"baseline_vis_{saved:02d}.png")
+                        out_path = os.path.join(vis_dir, f"baseline_{model_name}_vis_{saved:02d}.png")
                         fig.savefig(out_path, dpi=150, bbox_inches='tight')
                         plt.close(fig)
                         saved += 1
@@ -416,6 +475,8 @@ def run_pretrained_baseline(
         "train": {"per_class": train_per, "mean": train_mean},
         "test":  {"per_class": test_per,  "mean": test_mean},
         "metric": metric_name,
+        "model_name": model_name,
         "run_dir": run_dir,
     }
 
+# endregion

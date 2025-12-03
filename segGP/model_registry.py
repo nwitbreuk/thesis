@@ -75,6 +75,40 @@ def make_feat_extractor(model_name):
         return felgp_fs._extract_features_from_model(_cached_model, x, cache_key=model_name)
     return feat_fn
 
+def make_segmenter(model_name, num_classes: int):
+    """
+    Return a callable(x) -> logits (B, k, H, W) that runs the model as a segmenter.
+    For feature-extractor backbones, we project features to k-class logits.
+    For custom models (aoi/nadia), we use custom_model_infer and project if needed.
+    """
+    import seggp_functions as felgp_fs
+
+    config = MODEL_CONFIGS[model_name]
+    k = int(num_classes)
+
+    if model_name in ["custom_aoi", "nadia_model"]:
+        # Use custom model infra; load now for baseline
+        felgp_fs.set_custom_model(
+            path=config["path"],
+            model_builder=config.get("builder"),  # None for both models
+            normalize=True,
+            eager_load=True
+        )
+        def fn(x):
+            out = felgp_fs.custom_model_infer(x, scale=1.0)           # (B,C?,H,W)
+            out4 = felgp_fs._as_nchw(out)
+            if out4.shape[1] != k:
+                return felgp_fs.feature_to_logits(out4, k)
+            return out4
+        return fn
+
+    # Feature-extractor models: build extractor then project to k
+    feat_extractor_fn = make_feat_extractor(model_name)
+    def fn(x):
+        feats = feat_extractor_fn(x)                                  # (B,32,H,W)
+        return felgp_fs.feature_to_logits(feats, k)                   # (B,k,H,W)
+    return fn
+
 def register_model_primitives(pset, models_to_use, color_mode, run_mode):
     """
     Register model primitives based on configuration.
