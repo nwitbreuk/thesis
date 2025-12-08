@@ -423,7 +423,6 @@ def run_pretrained_baseline(
                         preds = (probs > 0.5).float()
                         cmap = 'gray'
 
-                    # Loop samples in this batch
                     B = imgs.shape[0]
                     for b in range(B):
                         if saved >= vis_count:
@@ -440,17 +439,22 @@ def run_pretrained_baseline(
                             mask_np = mask_t.squeeze(0).numpy()
                         else:
                             mask_np = mask_t.numpy()
-                        pred_np = pred_t.squeeze(0).numpy()
+                        
+                        # ✅ Ensure pred is 2D (H,W) not (1,H,W)
+                        pred_np = pred_t.squeeze(0).numpy() if pred_t.dim() == 3 else pred_t.numpy()
 
                         fig, axs = plt.subplots(1, 3, figsize=(9, 3))
                         axs[0].imshow(img_np, cmap='gray' if img_np.ndim==2 else None)
                         axs[0].set_title("Input")
+                        
                         if num_classes > 1:
-                            axs[1].imshow(pred_np, cmap=cmap, vmin=0, vmax=max(1, num_classes-1))
-                            axs[2].imshow(mask_np, cmap=cmap, vmin=0, vmax=max(1, num_classes-1))
+                            # ✅ Both pred and mask are 0..num_classes-1 (remapped)
+                            axs[1].imshow(pred_np, cmap=cmap, vmin=0, vmax=num_classes-1)
+                            axs[2].imshow(mask_np, cmap=cmap, vmin=0, vmax=num_classes-1)
                         else:
-                            axs[1].imshow(pred_np, cmap='gray')
-                            axs[2].imshow(mask_np, cmap='gray')
+                            axs[1].imshow(pred_np, cmap='gray', vmin=0, vmax=1)
+                            axs[2].imshow(mask_np, cmap='gray', vmin=0, vmax=1)
+                        
                         axs[1].set_title("Prediction")
                         axs[2].set_title("Ground Truth")
                         for ax in axs:
