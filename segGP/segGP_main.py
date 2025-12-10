@@ -1,3 +1,4 @@
+import logging
 import operator
 import argparse
 import random
@@ -26,19 +27,22 @@ from miou_eval import eval_dataset_miou  # dataset-level mIoU (no penalties inte
 from algo_iegp import run_pretrained_baseline  # baseline eval without GP
 import sys
 
+logging.getLogger("torch.hub").setLevel(logging.ERROR)
+logging.getLogger("torchvision").setLevel(logging.ERROR)
+
 
 # User-configurable options
 COLOR_MODE = "rgb"  # "rgb" or "gray"
 DATASET = "voc" # "voc" or "coco" or "aoi"
-BASELINE_ONLY = True # run only the pretrained NN and exit
-RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi_fast", "aoi_normal"
+BASELINE_ONLY = False # run only the pretrained NN and exit
+RUN_MODE = "normal"  # "fast", "middle", "normal" or "aoi_fast", "aoi_normal"
 randomSeeds = 12
 Run_title_SUFFIX = ""  # Optional suffix for run name
 
 # ---- Model Selection ----
 # Choose which NN models to include as primitives
-# Options: "deeplabv3_resnet50", "resnet18", "resnet50", "mobilenet_v3_small", "efficientnet_b0", "custom_aoi"
-MODELS_TO_USE = ["nadia_model", "resnet18", "mobilenet_v3_small"]  # Add/remove models here
+# Options: "deeplabv3_resnet50", "resnet18", "resnet50", "mobilenet_v3_small", "efficientnet_b0", "custom_aoi" , "shufflenet_v2_x1_0"
+MODELS_TO_USE = ["nadia_model", "resnet18", "resnet50"]  # Add/remove models here
 #MODELS_TO_USE = ["custom_aoi"]  # Add/remove models here
 
 # ---- Fitness Function Selection ----
@@ -95,8 +99,8 @@ elif DATASET == 'coco':
     mask_dir = "/dataB1/niels_witbreuk/data/coco/masks+"
 elif DATASET == 'aoi':
     dataSetName = 'aoi'
-    image_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/test/img"
-    mask_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/test/lbl"
+    image_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/train/img"
+    mask_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/train/lbl"
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
 
@@ -116,7 +120,7 @@ if SELECTED_CLASSES:
         dataset = ImagePreFilterWrapper(dataset, target_ids, ignore_index=DEFAULT_IGNORE_INDEX, require_all=False, min_match=1)
 
 # Build remap and wrap
-CLASS_TO_IDX, IGNORE_INDEX_DEFAULT = build_class_remap(SELECTED_CLASSES, NUM_CLASSES, ignore_index=DEFAULT_IGNORE_INDEX, drop_background=False)
+CLASS_TO_IDX, IGNORE_INDEX_DEFAULT = build_class_remap(SELECTED_CLASSES, NUM_CLASSES, ignore_index=DEFAULT_IGNORE_INDEX, drop_background=True)
 IGNORE_INDEX = getattr(dataset, 'ignore_index', IGNORE_INDEX_DEFAULT)
 if CLASS_TO_IDX is not None:
     dataset = RemapWrapper(dataset, CLASS_TO_IDX, IGNORE_INDEX)
@@ -195,24 +199,82 @@ test_loader  = DataLoader(test_dataset, batch_size=_MODE_BATCH_SIZE,
 # --- Calculate class weights for weighted loss ---
 # Calculate weights ONLY if using weighted loss
 def calculate_class_weights(loader, num_classes, ignore_idx):
-        print("Calculating class weights for weighted loss...")
-        counts = torch.zeros(num_classes, device=device)
-        for _, masks in tqdm(loader, desc="Counting classes", leave=False, disable=True):
-            masks = masks.to(device)
-            for i in range(num_classes):
-                if i == ignore_idx: continue
-                counts[i] += (masks == i).sum()
-        total_valid_pixels = counts.sum()
-        class_weights = total_valid_pixels / (counts + 1e-6)
-        class_weights = class_weights / class_weights.sum() * num_classes
-        print(f"Calculated weights: {class_weights.cpu().numpy()}")
-        return class_weights.float()
+    print("Calculating class weights for weighted loss...")
+    counts = torch.zeros(num_classes, device=device)
+    for _, masks in tqdm(loader, desc="Counting classes", leave=False, disable=True):
+        masks = masks.to(device)
+        for i in range(num_classes):
+            if i == ignore_idx: continue
+            counts[i] += (masks == i).sum()
+    total_valid_pixels = counts.sum()
+    class_weights = total_valid_pixels / (counts + 1e-6)
+    class_weights = class_weights / class_weights.sum() * num_classes
+    print(f"Calculated weights: {class_weights.cpu().numpy()}")
+    return class_weights.float()
+
+# ✅ NEW: Calculate class distribution for run info
+def calculate_class_distribution(loader, num_classes, ignore_idx):
+    """
+    Calculate:
+    1. Pixel-level class distribution (total pixels per class)
+    2. Image-level class presence (how many images contain each class)
+    """
+    pixel_counts = torch.zeros(num_classes, device=device)
+    image_presence = torch.zeros(num_classes, device=device)
+    total_images = 0
+    
+    for _, masks in tqdm(loader, leave=False, disable=True):
+        masks = masks.to(device)
+        total_images += masks.shape[0]
+        
+        # Pixel-level counts
+        for i in range(num_classes):
+            if i == ignore_idx:
+                continue
+            pixel_counts[i] += (masks == i).sum()
+        
+        # Image-level presence: does this batch contain class i?
+        for i in range(num_classes):
+            if i == ignore_idx:
+                continue
+            # For each image in batch, check if it contains class i
+            for b in range(masks.shape[0]):
+                if (masks[b] == i).any():
+                    image_presence[i] += 1
+    
+    return pixel_counts.cpu().numpy(), image_presence.cpu().numpy(), total_images
 
 class_weights = None
 if FITNESS_FUNCTION == "weighted_ce" and NUM_CLASSES > 1:
     class_weights = calculate_class_weights(train_loader, NUM_CLASSES, IGNORE_INDEX)
 else:
     class_weights = None
+
+
+print("\nComputing class distribution...")
+train_pixel_dist, train_image_dist, train_total_images = calculate_class_distribution(
+    train_loader, NUM_CLASSES, IGNORE_INDEX
+)
+test_pixel_dist, test_image_dist, test_total_images = calculate_class_distribution(
+    test_loader, NUM_CLASSES, IGNORE_INDEX
+)
+
+class_dist_info = {
+    "train": {
+        "pixel_counts": train_pixel_dist.tolist(),
+        "image_presence": train_image_dist.tolist(),
+        "total_images": int(train_total_images),
+        "pixel_percentages": (train_pixel_dist / train_pixel_dist.sum() * 100).tolist(),
+        "image_percentages": (train_image_dist / train_total_images * 100).tolist(),
+    },
+    "test": {
+        "pixel_counts": test_pixel_dist.tolist(),
+        "image_presence": test_image_dist.tolist(),
+        "total_images": int(test_total_images),
+        "pixel_percentages": (test_pixel_dist / test_pixel_dist.sum() * 100).tolist(),
+        "image_percentages": (test_image_dist / test_total_images * 100).tolist(),
+    }
+}
 
 if BASELINE_ONLY:
     print(f"[Baseline] Evaluating models {MODELS_TO_USE} on dataset '{dataSetName}' (classes={NUM_CLASSES}, selected={SELECTED_CLASSES})...")
@@ -232,6 +294,7 @@ if BASELINE_ONLY:
         randomSeeds=randomSeeds,
         save_visuals=True,
         vis_count=6,
+        params={"class_distribution": class_dist_info}
     )
     sys.exit(0)
 
@@ -257,9 +320,10 @@ params = {
         "num_classes": NUM_CLASSES,
         "image_dir": image_dir,
         "mask_dir": mask_dir,
+        "class_to_idx": CLASS_TO_IDX,
+        "ignore_index": IGNORE_INDEX_DEFAULT,
+        "class_distribution": class_dist_info
     }
-params["selected_classes"] = SELECTED_CLASSES
-params["ignore_index"] = IGNORE_INDEX
 
 # endregion ==== GP Setup ====
 
@@ -270,9 +334,30 @@ _INPUT_TYPE = seg_types.RGBImage if COLOR_MODE == "rgb" else seg_types.GrayImage
 _OUTPUT_TYPE = seg_types.FeatureMap if NUM_CLASSES > 1 else seg_types.Mask
 pset = gp.PrimitiveSetTyped('MAIN', [_INPUT_TYPE], _OUTPUT_TYPE, prefix='Image')
 
-# Add Basic Math Operators
-# Math operators operate on intermediate feature maps
 tp = felgp_fs.trace_primitive
+
+# 1. Transformation Primitives (Image -> Image)
+# These modify the input image BEFORE it hits the Neural Networks.
+# We use 'float' terminals for parameters, which the wrappers map to correct ranges.
+pset.addPrimitive(tp("MixImg", felgp_fs.mix_img), [_INPUT_TYPE, _INPUT_TYPE, float], _INPUT_TYPE, name="MixImg")
+#pset.addPrimitive(tp("Bilateral", felgp_fs.trans_bilateral), [_INPUT_TYPE, float, float], _INPUT_TYPE, name="Bilateral")
+pset.addPrimitive(tp("Blur", felgp_fs.trans_blur), [_INPUT_TYPE, float], _INPUT_TYPE, name="Blur")
+pset.addPrimitive(tp("Sharpen", felgp_fs.trans_sharpen), [_INPUT_TYPE, float], _INPUT_TYPE, name="Sharpen")
+pset.addPrimitive(tp("Contrast", felgp_fs.trans_contrast), [_INPUT_TYPE, float], _INPUT_TYPE, name="Contrast")
+pset.addPrimitive(tp("Gamma", felgp_fs.trans_gamma), [_INPUT_TYPE, float], _INPUT_TYPE, name="Gamma")
+pset.addPrimitive(tp("Rotate", felgp_fs.trans_rotate), [_INPUT_TYPE, float], _INPUT_TYPE, name="Rotate")
+pset.addPrimitive(tp("Translate", felgp_fs.trans_translate), [_INPUT_TYPE, float, float], _INPUT_TYPE, name="Translate")
+pset.addPrimitive(tp("Brightness", felgp_fs.trans_brightness), [_INPUT_TYPE, float], _INPUT_TYPE, name="Brightness")
+pset.addPrimitive(tp("Solarize", felgp_fs.trans_solarize), [_INPUT_TYPE, float], _INPUT_TYPE, name="Solarize")
+
+# 2. NN model primitives (Image -> FeatureMap)
+# These consume the (potentially transformed) image and produce feature maps.
+register_model_primitives(pset, MODELS_TO_USE, COLOR_MODE, RUN_MODE)
+if RUN_MODE == "aoi":
+    pset.addPrimitive(tp("aoiModel", felgp_fs.custom_model_infer), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="aoiModel")
+
+# 3. Other Primitives (FeatureMap -> FeatureMap)
+# These operate on the feature maps produced by the NNs.
 pset.addPrimitive(tp("Add", felgp_fs.add), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Add")
 pset.addPrimitive(tp("Sub", felgp_fs.sub), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Sub")
 pset.addPrimitive(tp("Mul", felgp_fs.mul), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Mul")
@@ -290,21 +375,17 @@ pset.addPrimitive(tp("LogicalAnd", felgp_fs.logical_and), [seg_types.FeatureMap,
 pset.addPrimitive(tp("LogicalXor", felgp_fs.logical_xor), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalXor")
 pset.addPrimitive(tp("Normalize", felgp_fs.normalize), [seg_types.FeatureMap], seg_types.FeatureMap, name="Normalize")
 
-pset.addPrimitive(tp("SobelX", felgp_fs.sobel_x), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="SobelX")
-pset.addPrimitive(tp("SobelY", felgp_fs.sobel_y), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="SobelY")
-pset.addPrimitive(tp("Laplacian", felgp_fs.laplacian), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="Laplacian")
-pset.addPrimitive(tp("GradientMagnitude", felgp_fs.gradient_magnitude), [seg_types.GrayImage] if COLOR_MODE=="gray" else [seg_types.RGBImage], seg_types.FeatureMap, name="GradientMagnitude")
+# Edge filters operate on Images but produce FeatureMaps (similar to NNs)
+pset.addPrimitive(tp("SobelX", felgp_fs.sobel_x), [_INPUT_TYPE], seg_types.FeatureMap, name="SobelX")
+pset.addPrimitive(tp("SobelY", felgp_fs.sobel_y), [_INPUT_TYPE], seg_types.FeatureMap, name="SobelY")
+pset.addPrimitive(tp("Laplacian", felgp_fs.laplacian), [_INPUT_TYPE], seg_types.FeatureMap, name="Laplacian")
+pset.addPrimitive(tp("GradientMagnitude", felgp_fs.gradient_magnitude), [_INPUT_TYPE], seg_types.FeatureMap, name="GradientMagnitude")
+pset.addPrimitive(tp("EdgeFilter", felgp_fs.apply_depthwise_edge), [_INPUT_TYPE, float], seg_types.FeatureMap, name="EdgeFilter")
+pset.addPrimitive(tp("Gauss", felgp_fs.gaussian_blur_param), [_INPUT_TYPE, float], seg_types.FeatureMap, name="Gauss")
 
 # Combination primitives
 pset.addPrimitive(tp("Mix", felgp_fs.mix), [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="Mix")
 pset.addPrimitive(tp("IfElse", felgp_fs.if_then_else), [seg_types.FeatureMap, seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="IfElse")
-pset.addPrimitive(tp("Gauss", felgp_fs.gaussian_blur_param), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="Gauss")
-
-# NN model primitives
-register_model_primitives(pset, MODELS_TO_USE, COLOR_MODE, RUN_MODE)
-if RUN_MODE == "aoi":
-    pset.addPrimitive(tp("aoiModel", felgp_fs.custom_model_infer), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="aoiModel")
-pset.addPrimitive(tp("EdgeFilter", felgp_fs.apply_depthwise_edge), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="EdgeFilter")
 
 # Output conversion primitives
 if NUM_CLASSES == 1:
@@ -459,11 +540,19 @@ def evalTrain(toolbox, individual, hof):
                     
                     logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, NUM_CLASSES)
                     masks_flat = masks.view(-1).long()
-                    loss = F.cross_entropy(logits_flat, masks_flat, weight=class_weights, ignore_index=IGNORE_INDEX) # type: ignore
                     
-                    if torch.isinf(loss) or torch.isnan(loss): continue
-                    total_loss += loss.item()
-                    batch_count += 1
+                    # ✅ Exclude background (class 0) AND ignore_index (255) from loss
+                    valid_mask = (masks_flat != IGNORE_INDEX) & (masks_flat != 0)
+                    if valid_mask.sum() > 0:
+                        loss = F.cross_entropy(
+                            logits_flat[valid_mask], 
+                            masks_flat[valid_mask], 
+                            weight=class_weights, 
+                            ignore_index=IGNORE_INDEX # type: ignore
+                        )
+                        if not (torch.isinf(loss) or torch.isnan(loss)):
+                            total_loss += loss.item()
+                            batch_count += 1
             
             avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
             return (-avg_loss,)  # Negative because DEAP maximizes
@@ -564,7 +653,11 @@ def evalTest(toolbox, individual, test_loader):
             dice = (2.0 * inter_total / (union_total + 1e-6)) if union_total > 0 else 0.0
             return dice
         else:
-            _, miou = eval_dataset_miou(toolbox, individual, test_loader, NUM_CLASSES, device=device, ignore_index=IGNORE_INDEX)
+            _, miou = eval_dataset_miou(
+                toolbox, individual, test_loader, NUM_CLASSES, 
+                device=device, ignore_index=IGNORE_INDEX,
+                exclude_background=True  # ✅ NEW
+            )
             return miou
     except Exception as e:
         print("Evaluation error (test):", e)
@@ -621,6 +714,10 @@ if __name__ == "__main__":
     except Exception as _e:
         print(f"[warn] failed to write primitive/terminal catalogs: {_e}")
 
-    data_handling._copy_slurm_logs(run_dir, meta)
     print("testResults", testResults)
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    data_handling._copy_slurm_logs(run_dir, meta)
+
 

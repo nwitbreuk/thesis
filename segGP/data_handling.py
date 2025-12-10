@@ -294,6 +294,17 @@ def saveAllResults(params, hof, trainTime, testResults, log, outdir="/dataB1/nie
 def build_class_remap(selected: list[int] | None, k: int,
                       ignore_index: int = DEFAULT_IGNORE_INDEX,
                       drop_background: bool = False):
+    """
+    Build a mapping from original class IDs to new contiguous indices.
+    
+    Args:
+        selected: list of original class IDs to include; if None or empty, returns (None, None)
+        k: maximum number of classes to map to
+        ignore_index: label value to ignore
+        drop_background: if True, exclude background class (0) from mapping
+    Returns:
+        (class_to_idx, ignore_index) where class_to_idx maps original IDs to new indices, or (None, None) if no remapping is needed.
+    """
     if not selected:
         return None, None
     # exclude ignore and optionally background (0)
@@ -301,13 +312,7 @@ def build_class_remap(selected: list[int] | None, k: int,
     class_to_idx = {cid: i for i, cid in enumerate(selected[:k])}
     return class_to_idx, ignore_index
 
-def remap_mask_tensor(mask: torch.Tensor, class_to_idx: dict[int, int], ignore_index: int) -> torch.Tensor:
-    if mask.dim() == 3 and mask.shape[0] == 1:
-        mask = mask.squeeze(0)
-    out = torch.full_like(mask, ignore_index)
-    for cid, new_idx in class_to_idx.items():
-        out = torch.where(mask == cid, torch.as_tensor(new_idx, dtype=out.dtype, device=out.device), out)
-    return out
+
 
 class RemapWrapper(Dataset):
     def __init__(self, base: Dataset, class_to_idx: dict[int,int] | None, ignore_index: int | None):
@@ -323,6 +328,14 @@ class RemapWrapper(Dataset):
     
 def _count_matches(present: set[int], wanted: set[int]) -> int:
     return len(present & wanted)
+
+def remap_mask_tensor(mask: torch.Tensor, class_to_idx: dict[int, int], ignore_index: int) -> torch.Tensor:
+    if mask.dim() == 3 and mask.shape[0] == 1:
+        mask = mask.squeeze(0)
+    out = torch.full_like(mask, ignore_index)
+    for cid, new_idx in class_to_idx.items():
+        out = torch.where(mask == cid, torch.as_tensor(new_idx, dtype=out.dtype, device=out.device), out)
+    return out
 class ImagePreFilterWrapper(Dataset):
     def __init__(self, base_dataset: Dataset, selected_ids: set[int],
                  ignore_index: int = DEFAULT_IGNORE_INDEX,
