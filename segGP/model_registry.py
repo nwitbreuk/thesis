@@ -9,7 +9,7 @@ from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet
 from torchvision.models import mobilenet_v3_small, mobilenet_v3_large, resnet18, resnet50, efficientnet_b0, MobileNet_V3_Large_Weights
 import seggp_functions as felgp_fs
 
-def _build_nadia_model():
+def _build_nadia_model(model_name):
     # 1. Define the correct architecture (DeepLabV3+, not just MobileNet backbone)
     model = deeplabv3_mobilenet_v3_large(
         weights=None,
@@ -18,7 +18,8 @@ def _build_nadia_model():
         aux_loss=True
     )
     # 2. Load weights handling the ['model'] key
-    path = "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_1000new.pth"
+    config = MODEL_CONFIGS[model_name]
+    path = config.get("path", "")
     if os.path.exists(path):
         print(f"[Model Registry] Loading custom weights from {path}")
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
@@ -68,21 +69,179 @@ MODEL_CONFIGS = {
         "is_segmenter": False,
         "description": "EfficientNet-B0"
     },
-    "custom_aoi": {
+    "aoi_1": {
         "path": "/dataB1/aoi/benchmarks/model_library/ensemble_models/v2/ensemble_model_1.pth",
-        "builder": None,  # loaded directly
+        "builder": None,
         "feature_extractor": False,
         "is_segmenter": True,
-        "description": "Custom AOI ensemble model"
+        "is_custom": True,
+        "prim_name": "aoi_1",
+        "description": "Custom AOI ensemble model 1",
     },
-    "nadia_model": {
+    "aoi_2": {
+        "path": "/dataB1/aoi/benchmarks/model_library/ensemble_models/v2/ensemble_model_2.pth",
+        "builder": None,
+        "feature_extractor": False,
+        "is_segmenter": True,
+        "is_custom": True,
+        "prim_name": "aoi_2",
+        "description": "Custom AOI ensemble model 2",
+    },
+    "aoi_3": {
+        "path": "/dataB1/aoi/benchmarks/model_library/ensemble_models/v2/ensemble_model_3.pth",
+        "builder": None,
+        "feature_extractor": False,
+        "is_segmenter": True,
+        "is_custom": True,
+        "prim_name": "aoi_3",
+        "description": "Custom AOI ensemble model 2",
+    },
+    "aoi_4": {
+        "path": "/dataB1/aoi/benchmarks/model_library/general_models/v2/ddrnet_0_6_57_2750.h5",
+        "builder": None,
+        "feature_extractor": False,
+        "is_segmenter": True,
+        "is_custom": True,
+        "prim_name": "aoi_4",
+        "description": "Custom AOI ensemble model 4",
+    },
+    "model1": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_12345.pth",
+        "builder": lambda: _build_nadia_model("model1"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model1",      # optional, defaults to model_name
+        "description": "Nadia's custom segmentation model 1",
+    },
+    "model2": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_32823.pth",
+        "builder": lambda: _build_nadia_model("model2"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model2",
+        "description": "Nadia's custom segmentation model 2",
+    },
+    "model3": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_57923.pth",
+        "builder": lambda: _build_nadia_model("model3"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model3",
+        "description": "Nadia's custom segmentation model 3",
+    },
+    "model4": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_70852.pth",
+        "builder": lambda: _build_nadia_model("model4"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model4",
+        "description": "Nadia's custom segmentation model 4",
+    },
+    "model5": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_97245.pth",
+        "builder": lambda: _build_nadia_model("model5"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model5",
+        "description": "Nadia's custom segmentation model 5",
+    },
+    "model6": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_126181.pth",
+        "builder": lambda: _build_nadia_model("model6"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model6",
+        "description": "Nadia's custom segmentation model 6",
+    },
+    "model7": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_10new.pth",
+        "builder": lambda: _build_nadia_model("model7"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model7",
+        "description": "Nadia's custom segmentation model 7",
+    },
+    "model8": {
         # Path is required by seggp_functions, but our builder handles the actual loading.
         "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_1000new.pth",
-        "builder": _build_nadia_model,  # ✅ Use the custom builder defined above
-        "feature_extractor": True, 
+        "builder": lambda: _build_nadia_model("model8"),
+        "feature_extractor": True,
         "is_segmenter": True,
-        "description": "Nadia's custom segmentation model"
-    }
+        "is_custom": True,          # <---
+        "prim_name": "model8",
+        "description": "Nadia's custom segmentation model 8",
+    },
+    "model9": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_9000new.pth",
+        "builder": lambda: _build_nadia_model("model9"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model9",
+        "description": "Nadia's custom segmentation model 9",
+    },
+    "model10": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_12000new.pth",
+        "builder": lambda: _build_nadia_model("model10"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model10",
+        "description": "Nadia's custom segmentation model 10",
+    },
+    "model11": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_15000new.pth",
+        "builder": lambda: _build_nadia_model("model11"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model11",
+        "description": "Nadia's custom segmentation model 11",
+    },
+    "model12": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_19000new.pth",
+        "builder": lambda: _build_nadia_model("model12"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model12",
+        "description": "Nadia's custom segmentation model 12",
+    },
+    "model13": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_22000new.pth",
+        "builder": lambda: _build_nadia_model("model13"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model13",
+        "description": "Nadia's custom segmentation model 13",
+    },
+    "model14": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_25000new.pth",
+        "builder": lambda: _build_nadia_model("model14"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model14",
+        "description": "Nadia's custom segmentation model 14",
+    },
+    "model15": {
+        "path": "/dataB2/archive/home/nadia_dobreva/PyTorch_CIFAR10/pascal_models/state_dicts/pascalvoc_mobilenetv3_28000new.pth",
+        "builder": lambda: _build_nadia_model("model11"),
+        "feature_extractor": True,
+        "is_segmenter": True,
+        "is_custom": True,          # <---
+        "prim_name": "model15",
+        "description": "Nadia's custom segmentation model 15",
+    },
+    
 }
 
 # Wrap model as feature extractor
@@ -108,11 +267,25 @@ def make_feat_extractor(model_name):
 
 def make_segmenter(model_name, num_classes: int, selected_classes: list[int] | None = None):
     """
-    Return a callable(x) -> logits (B, k, H, W).
+     Return a callable(x) -> logits (B, k, H, W) for baseline evaluation.
     
-    If the model is a known segmenter (DeepLab, Custom), we attempt to slice
-    the specific output channels corresponding to 'selected_classes'.
-    Otherwise, we project features using a random head (baseline will be poor).
+     Args:
+          model_name: Model identifier from MODEL_CONFIGS
+          num_classes: Number of output classes (k)
+          selected_classes: Optional list of class IDs to select (e.g., [15, 8, 12] for VOC)
+    
+     Behavior:
+     1. VOC/Nadia models (21 output channels):
+         - Without selection: returns all 21 channels (or projects if k != 21)
+         - With selection [15,8,12]: slices channels 15,8,12 -> returns 3 channels [0,1,2]
+       
+     2. AOI models (5 output channels):
+         - Already trained on remapped data [0,1,2,3,4]
+         - Returns output as-is (no slicing needed)
+       
+     3. Feature extractors (backbones only):
+         - Adds a random conv head to project features -> k channels
+         - Baseline performance will be poor (random)
     """
     import seggp_functions as felgp_fs
 
@@ -122,8 +295,7 @@ def make_segmenter(model_name, num_classes: int, selected_classes: list[int] | N
 
     # 1. Handle Segmentation Models (DeepLab, Nadia, Custom)
     if is_segmenter:
-        # Load model logic
-        if model_name in ["custom_aoi", "nadia_model"]:
+        if config.get("is_custom", False):
             felgp_fs.set_custom_model(
                 path=config["path"],
                 model_builder=config.get("builder"),
@@ -141,27 +313,43 @@ def make_segmenter(model_name, num_classes: int, selected_classes: list[int] | N
             feat_fn = make_feat_extractor(model_name)
             _raw_infer = feat_fn
 
-        # Wrapper to handle channel slicing
+        # Wrapper to handle channel slicing/remapping
         def fn(x):
+            """
+            Infers segmentation logits and handles channel mapping.
+
+            x: (B,C_in,H,W)
+            returns: (B,k,H,W)
+            """
             out = _raw_infer(x) # (B, C_out, H, W)
             out = felgp_fs._as_nchw(out)
+            C_out = out.shape[1]
             
-            # If we have specific classes to select (e.g. [15, 8, 12])
-            if selected_classes is not None and len(selected_classes) == k:
-                # Filter out ignore index if present in selection (though usually handled by caller)
-                valid_indices = [c for c in selected_classes if c != 255]
-                
-                # Check if indices are within model output range
-                if valid_indices and max(valid_indices) < out.shape[1]:
-                    # ✅ SLICE: Pick exactly the channels we want
+            # Case 1: AOI models already output k channels [0,1,2,3,4] correctly
+            # No remapping needed - they're pre-trained on remapped data
+            if "aoi" in model_name.lower():
+                # AOI models output exactly k channels in correct order
+                if C_out == k:
+                    return out
+                else:
+                    # Unexpected: project to correct size
+                    print(f"[Warning] AOI model {model_name} output {C_out} channels, expected {k}")
+                    return felgp_fs._project_channels_cached(out, k)
+            
+            # Case 2: VOC/Nadia models (21 classes) - slice selected channels
+            # E.g., if selected_classes=[15,8,12], extract channels [15,8,12] -> [0,1,2]
+            if selected_classes and C_out > k:
+                # Slice the specific channels corresponding to selected channels
+                valid_indices = [c for c in selected_classes if c < C_out]
+                if len(valid_indices) == k:
                     return out[:, valid_indices, :, :]
             
-            # Fallback: if shapes match exactly
-            if out.shape[1] == k:
+            # Case 3: No selection or size already matches
+            if C_out == k:
                 return out
-                
-            # Fallback: Random projection (Performance will be low/random)
-            return felgp_fs.feature_to_logits(out, k)
+            
+            # Case 4: Fallback - project channels
+            return felgp_fs._project_channels_cached(out, k)
             
         return fn
 
@@ -195,14 +383,14 @@ def register_model_primitives(pset, models_to_use, color_mode, run_mode):
             continue
         
         # Register primitive based on model type
-        if model_name in ["custom_aoi", "nadia_model"]:
+        if config.get("is_custom", False):
             felgp_fs.set_custom_model(
                 path=config["path"],
                 model_builder=config.get("builder"),
                 normalize=True,
                 eager_load=False
             )
-            prim_name = "aoiModel" if model_name == "custom_aoi" else "nadiaModel"
+            prim_name = config.get("prim_name", model_name)
             pset.addPrimitive(
                 tp(prim_name, felgp_fs.custom_model_infer),
                 [_INPUT_TYPE, float],

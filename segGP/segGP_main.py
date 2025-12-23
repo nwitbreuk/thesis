@@ -8,6 +8,8 @@ from torch.utils.data import random_split, DataLoader
 from algo_iegp import run_baselines_for_models
 from model_registry import register_model_primitives
 import os
+import json 
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import numpy as np
 import time
 import multiprocessing
@@ -21,7 +23,7 @@ import seggp_functions as felgp_fs
 import seg_types
 from typing import Any, Callable
 from visualize import visualize_predictions
-from data_handling import ImagePreFilterWrapper, RemapWrapper, build_class_remap, _enumerate_primitives, _enumerate_terminals, pad_collate
+from data_handling import _seed_worker, ImagePreFilterWrapper, RemapWrapper, _set_global_seeds, build_class_remap, _enumerate_primitives, _enumerate_terminals, pad_collate
 import data_handling
 from miou_eval import eval_dataset_miou  # dataset-level mIoU (no penalties integrated)
 from algo_iegp import run_pretrained_baseline  # baseline eval without GP
@@ -34,34 +36,66 @@ logging.getLogger("torchvision").setLevel(logging.ERROR)
 # User-configurable options
 COLOR_MODE = "rgb"  # "rgb" or "gray"
 DATASET = "voc" # "voc" or "coco" or "aoi"
-BASELINE_ONLY = False # run only the pretrained NN and exit
-RUN_MODE = "normal"  # "fast", "middle", "normal" or "aoi_fast", "aoi_normal"
-randomSeeds = 12
+BASELINE_ONLY = True # run only the pretrained NN and exit
+INCLUDE_TRANSFORMS = True  # set False to exclude transformation functions from the primitive set
+RUN_MODE = "normal"  # "fast", "middle", "normal" or "aoi_fast", "aoi_normal", "long"
+randomSeeds = 8  # Change seed for different evolution paths
 Run_title_SUFFIX = ""  # Optional suffix for run name
 
-# ---- Model Selection ----
-# Choose which NN models to include as primitives
-# Options: "deeplabv3_resnet50", "resnet18", "resnet50", "mobilenet_v3_small", "efficientnet_b0", "custom_aoi" , "shufflenet_v2_x1_0"
-MODELS_TO_USE = ["nadia_model", "resnet18", "resnet50"]  # Add/remove models here
-#MODELS_TO_USE = ["custom_aoi"]  # Add/remove models here
+# Strategy: Use models with complementary strengths but not the best individual performers
+# This gives GP room to improve by combining them intelligently
+#MODELS_TO_USE = ["aoi_1", "aoi_2", "aoi_3"]  # Custom AOI models trained for epoxy segmentation
+MODELS_TO_USE = ["model3", "model4", "model6"]
+#MODELS_TO_USE = ["model1", "model2", "model3", "model4", "model5", "model6", "model7", "model8", "model9", "model10", "model11", "model12", "model13", "model14", "model15"] # Diverse models with test scores: 0.6748, 0.6851, 0.6793
 
-# ---- Fitness Function Selection ----
-# Options: "dice" (binary), "miou" (multiclass IoU), "weighted_ce" (weighted cross-entropy)
-FITNESS_FUNCTION = "miou"  # Change to "weighted_ce" to enable weighted loss
+FITNESS_FUNCTION = "miou"  # Options: "dice" (binary), "miou" (multiclass IoU), "weighted_ce" (weighted cross-entropy)
 
-# ---- Class selection (static config, no CLI) ----
-# Set to a list of dataset label IDs to include. Example for COCO/VOC: [2,5,17]
-# Leave as None to include all dataset classes.
+# ✅ Fitness bonuses configuration
+USE_DIVERSITY_BONUS = True   # Add bonus for using multiple different models in the tree
+USE_COMPLEXITY_BONUS = True  # Add bonus for larger tree sizes (encourages combining primitives)
+DIVERSITY_BONUS_PER_MODEL = 0.03  # Bonus per unique model used (reduced to prevent inflation)
+MAX_COMPLEXITY_BONUS = 0.05       # Maximum bonus for tree complexity (reduced to prevent inflation)
+
+# ✅ Data Augmentation Configuration
+# Use augmentation during training to give GP data diversity advantage
+USE_DATA_AUGMENTATION = True  # Set to False to disable augmentation
+AUGMENTATION_CONFIG = [
+    {"name": "adjust_brightness", "args": [{"name": "delta"}], "enabled": True},
+    {"name": "adjust_gamma",      "args": [{"name": "gamma"}], "enabled": True},
+    {"name": "adjust_contrast",   "args": [{"name": "alpha"}], "enabled": True},
+    {"name": "trans_blur",        "args": [{"name": "k_norm"}], "enabled": False},  # Can enable for more variety
+]
+# Augmentation parameters: shape (n_pipelines=2, n_transforms=len(AUGMENTATION_CONFIG))
+# Each (param_min, param_max, default_value) determines the range
+AUGMENTATION_PARAMS = {
+    "adjust_brightness": {"min": -0.5, "max": -0.5, "default": 0.0},
+    "adjust_gamma":      {"min": 1,  "max": 2, "default": 1.0},
+    "adjust_contrast":   {"min": 1,  "max": 2, "default": 1.0},
+    "trans_blur":        {"min": 0.5,  "max": 3.0, "default": 1.5},
+}
+
+os.environ["USE_DATA_AUGMENTATION"] = "1" if USE_DATA_AUGMENTATION else "0"
+os.environ["AUGMENTATION_CONFIG"] = json.dumps(AUGMENTATION_CONFIG)
+os.environ["AUGMENTATION_PARAMS"] = json.dumps(AUGMENTATION_PARAMS)
+
+# Set fitness bonus configuration in environment for run info
+os.environ["USE_DIVERSITY_BONUS"] = str(USE_DIVERSITY_BONUS)
+os.environ["USE_COMPLEXITY_BONUS"] = str(USE_COMPLEXITY_BONUS)
+os.environ["DIVERSITY_BONUS_PER_MODEL"] = str(DIVERSITY_BONUS_PER_MODEL)
+os.environ["MAX_COMPLEXITY_BONUS"] = str(MAX_COMPLEXITY_BONUS)
+
+
 SELECTED_CLASSES: list[int] | None = None
 # VOC: 15, 8, 12, 6, 19, 18
 # COCO 1, 67, 7, 65, 59, 22
 # AOI: 16, 31, 30, 24, 23
-SELECTED_CLASSES = [15, 8, 12 ]  # restrict classes 
+#SELECTED_CLASSES = [15, 8, 12, 6, 19, 18]  # restrict classes 
 
-# Optional: override the output number of classes, else len(SELECTED_CLASSES) or dataset default
-NUM_CLASSES_OVERRIDE: int | None = None
-# Default ignore index for excluded pixels
 DEFAULT_IGNORE_INDEX = 255
+
+_set_global_seeds(randomSeeds)
+g = torch.Generator()
+g.manual_seed(12345)
 
 # region ==== GP Setup ====
 
@@ -72,9 +106,9 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Infer number of classes from dataset selection
 if DATASET == 'voc':
-    inferred_classes = 22
+    inferred_classes = 21
 elif DATASET == 'coco':
-    inferred_classes = 81
+    inferred_classes = 80
 elif DATASET == 'aoi':
     inferred_classes = 5
 else:
@@ -84,9 +118,11 @@ else:
 if SELECTED_CLASSES and len(SELECTED_CLASSES) > 0:
     # exclude ignore id when counting output classes
     _selected_no_ignore = [cid for cid in SELECTED_CLASSES if cid != DEFAULT_IGNORE_INDEX]
-    NUM_CLASSES = NUM_CLASSES_OVERRIDE if NUM_CLASSES_OVERRIDE is not None else len(_selected_no_ignore)
+    NUM_CLASSES = len(_selected_no_ignore)
 else:
-    NUM_CLASSES = NUM_CLASSES_OVERRIDE if NUM_CLASSES_OVERRIDE is not None else inferred_classes
+    # Match model outputs: use the dataset's full number of classes
+    # Background exclusion is handled during evaluation/visualization, not by reducing channels.
+    NUM_CLASSES = inferred_classes
 
 
 if DATASET == 'voc':
@@ -99,8 +135,8 @@ elif DATASET == 'coco':
     mask_dir = "/dataB1/niels_witbreuk/data/coco/masks+"
 elif DATASET == 'aoi':
     dataSetName = 'aoi'
-    image_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/train/img"
-    mask_dir = "/dataB1/aoi/trainsets/epoxy/0.6.57/train/lbl"
+    image_dir = "/dataB1/aoi/benchmarks/ensemble_datasets/mitsumi/train/img"
+    mask_dir = "/dataB1/aoi/benchmarks/ensemble_datasets/mitsumi/train/lbl"
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
 
@@ -112,19 +148,61 @@ dataset = GeneralSegDataset(
     num_classes=NUM_CLASSES
 )
 
-# If selected classes are specified, pre-filter images: exclude ignore and background from the filter set
+# Build remap mapping FIRST (but don't wrap yet)
+CLASS_TO_IDX, IGNORE_INDEX_DEFAULT = build_class_remap(
+    SELECTED_CLASSES, NUM_CLASSES, 
+    ignore_index=DEFAULT_IGNORE_INDEX, 
+    drop_background=True
+)
+IGNORE_INDEX = getattr(dataset, 'ignore_index', IGNORE_INDEX_DEFAULT)
+
+# Filter on ORIGINAL class IDs (before remapping)
 if SELECTED_CLASSES:
     target_ids = set(cid for cid in SELECTED_CLASSES if cid not in (DEFAULT_IGNORE_INDEX, 0))
-    if target_ids: 
-        # require_all=True (all classes) or min_match=2 (at least 2 of them)
-        dataset = ImagePreFilterWrapper(dataset, target_ids, ignore_index=DEFAULT_IGNORE_INDEX, require_all=False, min_match=1)
+    if target_ids:
+        print(f"[Dataset] Filtering for original class IDs: {sorted(target_ids)}")
+        dataset = ImagePreFilterWrapper(
+            dataset,
+            target_ids,
+            ignore_index=DEFAULT_IGNORE_INDEX,
+            require_all=False,
+            min_match=1
+        )
+        if len(dataset) == 0:
+            raise RuntimeError(f"No images found containing classes {sorted(target_ids)}")
 
-# Build remap and wrap
-CLASS_TO_IDX, IGNORE_INDEX_DEFAULT = build_class_remap(SELECTED_CLASSES, NUM_CLASSES, ignore_index=DEFAULT_IGNORE_INDEX, drop_background=True)
-IGNORE_INDEX = getattr(dataset, 'ignore_index', IGNORE_INDEX_DEFAULT)
+# NOW apply remapping AFTER filtering
 if CLASS_TO_IDX is not None:
+    print(f"[Dataset] Applying class remapping: {CLASS_TO_IDX}")
     dataset = RemapWrapper(dataset, CLASS_TO_IDX, IGNORE_INDEX)
 
+if USE_DATA_AUGMENTATION:
+    print(f"[Dataset] Pre-computing augmented dataset...")
+    
+    # Create temporary wrapper to generate augmentations
+    temp_wrapper = data_handling.StaticAugmentationWrapper(
+        dataset,
+        augmentation_config=AUGMENTATION_CONFIG,
+        augmentation_params=AUGMENTATION_PARAMS,
+        seed=randomSeeds
+    )
+    
+    # Pre-compute all augmented samples
+    augmented_data = []
+    for i in tqdm(range(len(temp_wrapper)), desc="Augmenting"):
+        augmented_data.append(temp_wrapper[i])
+    
+    # Replace dataset with pre-augmented version
+    dataset = data_handling.PreAugmentedDataset(augmented_data)
+
+    # ✅ DIAGNOSTIC: Verify chain
+    print(f"[Dataset] Type after augmentation: {type(dataset)}")
+    print(f"[Dataset] Sample data in cache: {type(augmented_data[0])}, shapes: {augmented_data[0][0].shape}, {augmented_data[0][1].shape}")
+    
+    # Check if PreAugmentedDataset accidentally references temp_wrapper
+    if hasattr(dataset, 'base') and isinstance(dataset, data_handling.StaticAugmentationWrapper):
+        print(f"[WARNING] PreAugmentedDataset still wraps StaticAugmentationWrapper! Double augmentation happening.")
+    
 RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
 
 
@@ -136,6 +214,8 @@ RUN_NAME = data_handling.make_run_name(
     suffix=Run_title_SUFFIX,
     baseline_only=BASELINE_ONLY,
     SELECTED_CLASSES=SELECTED_CLASSES,
+    include_transforms=INCLUDE_TRANSFORMS,
+    use_data_augmentation=USE_DATA_AUGMENTATION,
 )
 
 # Presets per mode
@@ -143,16 +223,18 @@ _PRESETS = {
     "aoi_fast":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 1, "cap_train": 10,  "cap_test": 5},
     "aoi_normal": {"pop_size": 50, "generation": 30, "initialMaxDepth": 8, "maxDepth": 8,  "batch_size": 1, "cap_train": 10, "cap_test": 5},
     "fast":   {"pop_size": 10, "generation": 5,  "initialMaxDepth": 6, "maxDepth": 6,  "batch_size": 1, "cap_train": 80,  "cap_test": 32},
-    "middle": {"pop_size": 25, "generation": 15, "initialMaxDepth": 7, "maxDepth": 7,  "batch_size": 6, "cap_train": 200, "cap_test": 80},
-    "normal": {"pop_size": 50, "generation": 30, "initialMaxDepth": 8, "maxDepth": 8,  "batch_size": 8, "cap_train": 400, "cap_test": 160},
+    "middle": {"pop_size": 25, "generation": 15, "initialMaxDepth": 3, "maxDepth": 5,  "batch_size": 6, "cap_train": 200, "cap_test": 80},
+    "normal": {"pop_size": 50, "generation": 30, "initialMaxDepth": 3, "maxDepth": 5,  "batch_size": 8, "cap_train": 400, "cap_test": 160},
+    "long":   {"pop_size": 100,"generation": 50, "initialMaxDepth": 9, "maxDepth": 9,  "batch_size": 16,"cap_train": 600,"cap_test": 200},
 }
 preset = _PRESETS[RUN_MODE]
 
-# GP hyperparams (common values for all modes)
-cxProb     = 0.8
-mutProb    = 0.19
-elitismProb= 0.01
-initialMinDepth = 2
+
+# GP hyperparams (tuned for ensemble discovery)
+cxProb     = 0.7   # Slightly lower crossover to preserve good combinations
+mutProb    = 0.2  # Higher mutation to explore new model combinations
+elitismProb= 0.1  # Keep more elite individuals to preserve good ensembles
+initialMinDepth = 1  # Start with slightly deeper trees to encourage model combinations
 
 """
 Mode-dependent variables and data loaders will be initialized in __main__ after
@@ -190,10 +272,10 @@ if _MODE_CAP_TRAIN is not None or _MODE_CAP_TEST is not None:
 num_workers = min(4, os.cpu_count() or 1)
 pin = (device == 'cuda')
 train_loader = DataLoader(train_dataset, batch_size=_MODE_BATCH_SIZE,
-                           shuffle=True, collate_fn=pad_collate,
+                           shuffle=False, worker_init_fn=_seed_worker, generator=g, collate_fn=pad_collate,
                            num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
 test_loader  = DataLoader(test_dataset, batch_size=_MODE_BATCH_SIZE,
-                          shuffle=False, collate_fn=pad_collate,
+                          shuffle=False, worker_init_fn=_seed_worker, generator=g, collate_fn=pad_collate,
                           num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers>0)
 
 # --- Calculate class weights for weighted loss ---
@@ -264,15 +346,15 @@ class_dist_info = {
         "pixel_counts": train_pixel_dist.tolist(),
         "image_presence": train_image_dist.tolist(),
         "total_images": int(train_total_images),
-        "pixel_percentages": (train_pixel_dist / train_pixel_dist.sum() * 100).tolist(),
-        "image_percentages": (train_image_dist / train_total_images * 100).tolist(),
+        "pixel_percentages": (train_pixel_dist / max(train_pixel_dist.sum(), 1.0) * 100).tolist(),
+        "image_percentages": (train_image_dist / max(train_total_images, 1) * 100).tolist(),
     },
     "test": {
         "pixel_counts": test_pixel_dist.tolist(),
         "image_presence": test_image_dist.tolist(),
         "total_images": int(test_total_images),
-        "pixel_percentages": (test_pixel_dist / test_pixel_dist.sum() * 100).tolist(),
-        "image_percentages": (test_image_dist / test_total_images * 100).tolist(),
+        "pixel_percentages": (test_pixel_dist / max(test_pixel_dist.sum(), 1.0) * 100).tolist(),
+        "image_percentages": (test_image_dist / max(test_total_images, 1) * 100).tolist(),
     }
 }
 
@@ -296,7 +378,7 @@ if BASELINE_ONLY:
         vis_count=6,
         params={"class_distribution": class_dist_info}
     )
-    sys.exit(0)
+    #sys.exit(0)
 
 params = {
         "Dataset": dataSetName,
@@ -322,6 +404,10 @@ params = {
         "mask_dir": mask_dir,
         "class_to_idx": CLASS_TO_IDX,
         "ignore_index": IGNORE_INDEX_DEFAULT,
+        "include_transforms": INCLUDE_TRANSFORMS,
+        "use_data_augmentation": USE_DATA_AUGMENTATION,
+        "augmentation_config": AUGMENTATION_CONFIG if USE_DATA_AUGMENTATION else None,
+        "augmentation_params": AUGMENTATION_PARAMS if USE_DATA_AUGMENTATION else None,
         "class_distribution": class_dist_info
     }
 
@@ -339,49 +425,60 @@ tp = felgp_fs.trace_primitive
 # 1. Transformation Primitives (Image -> Image)
 # These modify the input image BEFORE it hits the Neural Networks.
 # We use 'float' terminals for parameters, which the wrappers map to correct ranges.
-pset.addPrimitive(tp("MixImg", felgp_fs.mix_img), [_INPUT_TYPE, _INPUT_TYPE, float], _INPUT_TYPE, name="MixImg")
-#pset.addPrimitive(tp("Bilateral", felgp_fs.trans_bilateral), [_INPUT_TYPE, float, float], _INPUT_TYPE, name="Bilateral")
-pset.addPrimitive(tp("Blur", felgp_fs.trans_blur), [_INPUT_TYPE, float], _INPUT_TYPE, name="Blur")
-pset.addPrimitive(tp("Sharpen", felgp_fs.trans_sharpen), [_INPUT_TYPE, float], _INPUT_TYPE, name="Sharpen")
-pset.addPrimitive(tp("Contrast", felgp_fs.trans_contrast), [_INPUT_TYPE, float], _INPUT_TYPE, name="Contrast")
-pset.addPrimitive(tp("Gamma", felgp_fs.trans_gamma), [_INPUT_TYPE, float], _INPUT_TYPE, name="Gamma")
-pset.addPrimitive(tp("Rotate", felgp_fs.trans_rotate), [_INPUT_TYPE, float], _INPUT_TYPE, name="Rotate")
-pset.addPrimitive(tp("Translate", felgp_fs.trans_translate), [_INPUT_TYPE, float, float], _INPUT_TYPE, name="Translate")
-pset.addPrimitive(tp("Brightness", felgp_fs.trans_brightness), [_INPUT_TYPE, float], _INPUT_TYPE, name="Brightness")
-pset.addPrimitive(tp("Solarize", felgp_fs.trans_solarize), [_INPUT_TYPE, float], _INPUT_TYPE, name="Solarize")
+if INCLUDE_TRANSFORMS:
+    #pset.addPrimitive(tp("MixImg", felgp_fs.mix_img), [_INPUT_TYPE, _INPUT_TYPE, float], _INPUT_TYPE, name="MixImg")
+    #pset.addPrimitive(tp("Bilateral", felgp_fs.trans_bilateral), [_INPUT_TYPE, float, float], _INPUT_TYPE, name="Bilateral")
+    #pset.addPrimitive(tp("Blur", felgp_fs.trans_blur), [_INPUT_TYPE, float], _INPUT_TYPE, name="Blur")
+    pset.addPrimitive(tp("Sharpen", felgp_fs.trans_sharpen), [_INPUT_TYPE, float], _INPUT_TYPE, name="Sharpen")
+    pset.addPrimitive(tp("Contrast", felgp_fs.trans_contrast), [_INPUT_TYPE, float], _INPUT_TYPE, name="Contrast")
+    pset.addPrimitive(tp("Gamma", felgp_fs.trans_gamma), [_INPUT_TYPE, float], _INPUT_TYPE, name="Gamma")
+    #pset.addPrimitive(tp("Rotate", felgp_fs.trans_rotate), [_INPUT_TYPE, float], _INPUT_TYPE, name="Rotate")
+    pset.addPrimitive(tp("Translate", felgp_fs.trans_translate), [_INPUT_TYPE, float, float], _INPUT_TYPE, name="Translate")
+    pset.addPrimitive(tp("Brightness", felgp_fs.trans_brightness), [_INPUT_TYPE, float], _INPUT_TYPE, name="Brightness")
+    pset.addPrimitive(tp("Solarize", felgp_fs.trans_solarize), [_INPUT_TYPE, float], _INPUT_TYPE, name="Solarize")
+
+# Image-to-feature projection (kept available regardless of INCLUDE_TRANSFORMS)
+pset.addPrimitive(tp("ImgToFeat", felgp_fs.img_to_feat), [_INPUT_TYPE], seg_types.FeatureMap, name="ImgToFeat")
 
 # 2. NN model primitives (Image -> FeatureMap)
 # These consume the (potentially transformed) image and produce feature maps.
 register_model_primitives(pset, MODELS_TO_USE, COLOR_MODE, RUN_MODE)
-if RUN_MODE == "aoi":
-    pset.addPrimitive(tp("aoiModel", felgp_fs.custom_model_infer), [seg_types.GrayImage, float] if COLOR_MODE=="gray" else [seg_types.RGBImage, float], seg_types.FeatureMap, name="aoiModel")
 
 # 3. Other Primitives (FeatureMap -> FeatureMap)
 # These operate on the feature maps produced by the NNs.
 pset.addPrimitive(tp("Add", felgp_fs.add), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Add")
-pset.addPrimitive(tp("Sub", felgp_fs.sub), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Sub")
+# pset.addPrimitive(tp("Sub", felgp_fs.sub), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Sub")
 pset.addPrimitive(tp("Mul", felgp_fs.mul), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="Mul")
-pset.addPrimitive(tp("SafeDiv", felgp_fs.safe_div), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="SafeDiv")
-pset.addPrimitive(tp("Abs", felgp_fs.abs_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Abs")
+# pset.addPrimitive(tp("SafeDiv", felgp_fs.safe_div), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="SafeDiv")
+# pset.addPrimitive(tp("Abs", felgp_fs.abs_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Abs")
 pset.addPrimitive(tp("Sqrt", felgp_fs.sqrt_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Sqrt")
-pset.addPrimitive(tp("Log", felgp_fs.log_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Log")
-pset.addPrimitive(tp("Exp", felgp_fs.exp_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Exp")
+# pset.addPrimitive(tp("Log", felgp_fs.log_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Log")
+# pset.addPrimitive(tp("Exp", felgp_fs.exp_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="Exp")
 pset.addPrimitive(tp("Sigmoid", felgp_fs.sigmoid), [seg_types.FeatureMap], seg_types.FeatureMap, name="Sigmoid")
-pset.addPrimitive(tp("tanh", felgp_fs.tanh_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="tanh")
+# pset.addPrimitive(tp("tanh", felgp_fs.tanh_f), [seg_types.FeatureMap], seg_types.FeatureMap, name="tanh")
 
-pset.addPrimitive(tp("LogicalNot", felgp_fs.logical_not), [seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalNot")
+# pset.addPrimitive(tp("LogicalNot", felgp_fs.logical_not), [seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalNot")
 pset.addPrimitive(tp("LogicalOr", felgp_fs.logical_or), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalOr")
 pset.addPrimitive(tp("LogicalAnd", felgp_fs.logical_and), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalAnd")
-pset.addPrimitive(tp("LogicalXor", felgp_fs.logical_xor), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalXor")
+# pset.addPrimitive(tp("LogicalXor", felgp_fs.logical_xor), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="LogicalXor")
 pset.addPrimitive(tp("Normalize", felgp_fs.normalize), [seg_types.FeatureMap], seg_types.FeatureMap, name="Normalize")
 
+# pset.addPrimitive(tp ("weighted_sum", felgp_fs.weighted_sum), [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="wSum")
+# pset.addPrimitive(tp("tMin", felgp_fs.min_tensor), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="tMin")
+# pset.addPrimitive(tp("tMax", felgp_fs.max_tensor), [seg_types.FeatureMap, seg_types.FeatureMap], seg_types.FeatureMap, name="tMax")
+# pset.addPrimitive(tp("clamp01", felgp_fs.clamp_unit), [seg_types.FeatureMap], seg_types.FeatureMap, name="clamp01")
+# pset.addPrimitive(tp("bias", felgp_fs.bias), [seg_types.FeatureMap, float], seg_types.FeatureMap, name="bias")
+# pset.addPrimitive(tp("scale", felgp_fs.scale), [seg_types.FeatureMap, float], seg_types.FeatureMap, name="scale")
+# pset.addPrimitive(tp("smBlend", felgp_fs.softmax_blend), [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="smBlend")
+# # If you want 3-way softmax, add with three Image args and a float temp.
+
 # Edge filters operate on Images but produce FeatureMaps (similar to NNs)
-pset.addPrimitive(tp("SobelX", felgp_fs.sobel_x), [_INPUT_TYPE], seg_types.FeatureMap, name="SobelX")
-pset.addPrimitive(tp("SobelY", felgp_fs.sobel_y), [_INPUT_TYPE], seg_types.FeatureMap, name="SobelY")
-pset.addPrimitive(tp("Laplacian", felgp_fs.laplacian), [_INPUT_TYPE], seg_types.FeatureMap, name="Laplacian")
-pset.addPrimitive(tp("GradientMagnitude", felgp_fs.gradient_magnitude), [_INPUT_TYPE], seg_types.FeatureMap, name="GradientMagnitude")
-pset.addPrimitive(tp("EdgeFilter", felgp_fs.apply_depthwise_edge), [_INPUT_TYPE, float], seg_types.FeatureMap, name="EdgeFilter")
-pset.addPrimitive(tp("Gauss", felgp_fs.gaussian_blur_param), [_INPUT_TYPE, float], seg_types.FeatureMap, name="Gauss")
+# pset.addPrimitive(tp("SobelX", felgp_fs.sobel_x), [_INPUT_TYPE], seg_types.FeatureMap, name="SobelX")
+# pset.addPrimitive(tp("SobelY", felgp_fs.sobel_y), [_INPUT_TYPE], seg_types.FeatureMap, name="SobelY")
+# pset.addPrimitive(tp("Laplacian", felgp_fs.laplacian), [_INPUT_TYPE], seg_types.FeatureMap, name="Laplacian")
+# pset.addPrimitive(tp("GradientMagnitude", felgp_fs.gradient_magnitude), [_INPUT_TYPE], seg_types.FeatureMap, name="GradientMagnitude")
+# pset.addPrimitive(tp("EdgeFilter", felgp_fs.apply_depthwise_edge), [_INPUT_TYPE, float], seg_types.FeatureMap, name="EdgeFilter")
+# pset.addPrimitive(tp("Gauss", felgp_fs.gaussian_blur_param), [_INPUT_TYPE, float], seg_types.FeatureMap, name="Gauss")
 
 # Combination primitives
 pset.addPrimitive(tp("Mix", felgp_fs.mix), [seg_types.FeatureMap, seg_types.FeatureMap, float], seg_types.FeatureMap, name="Mix")
@@ -395,16 +492,35 @@ elif NUM_CLASSES > 1:
     pset.addPrimitive(tp("FeatToLogits", lambda x: felgp_fs.feature_to_logits(x, NUM_CLASSES)),
                       [seg_types.FeatureMap], seg_types.FeatureMap, name="FeatToLogits")
     
-#Terminals
-# Float thresholds for Gt/Lt (use a named function for multiprocessing pickling)
-def rand_thresh():
-    return float(np.random.uniform(0.05, 0.95))
-pset.addEphemeralConstant('Thresh', rand_thresh, float)
+#Terminals (quantized for readability and search stability)
+def _quantize(x: float, step: float = 0.05, decimals: int = 2) -> float:
+    return float(np.round(np.round(x / step) * step, decimals))
+
 def rand_channel():
     return float(np.random.choice([8,16,32,64,128]))
 pset.addEphemeralConstant('Ch', rand_channel, float)
-def rand_alpha(): return float(np.random.uniform(0.0, 1.0))
+
+def rand_alpha():
+    return _quantize(float(np.random.uniform(0.0, 1.0)))
 pset.addEphemeralConstant('Alpha', rand_alpha, float)
+
+def rand_weight():
+    """Weights for blending feature maps - favor more extreme values for clearer decisions."""
+    base = float(np.random.choice([0.3, 0.5, 0.7]))
+    jitter = float(np.random.uniform(-0.1, 0.1))
+    return _quantize(base + jitter)
+
+def rand_scale():
+    """Scaling factor for feature magnitude (0.5-2.0 range)."""
+    return _quantize(float(np.random.uniform(0.5, 2.0)))
+
+def rand_threshold():
+    """Threshold for activations (normalized 0-1)."""
+    return _quantize(float(np.random.uniform(0.0, 1.0)))
+
+pset.addEphemeralConstant('Weight', rand_weight, float)
+pset.addEphemeralConstant('Scale', rand_scale, float)
+pset.addEphemeralConstant('Thresh', rand_threshold, float)
 
 # Collect available primitives (name and typed signature) for run info
 AVAILABLE_PRIMITIVES = _enumerate_primitives(pset)
@@ -531,8 +647,11 @@ def evalTrain(toolbox, individual, hof):
             # Weighted cross-entropy fitness
             total_loss = 0.0
             batch_count = 0
+            max_batches = 50  # Limit to prevent overfitting
             with torch.no_grad():
-                for imgs, masks in train_loader:
+                for batch_idx, (imgs, masks) in enumerate(train_loader):
+                    if batch_idx >= max_batches:
+                        break
                     imgs, masks = imgs.to(device), masks.to(device)
                     logits = func(imgs)
                     logits = _align_to_mask(logits, masks)
@@ -561,8 +680,11 @@ def evalTrain(toolbox, individual, hof):
             # Binary Dice fitness
             inter_total = 0.0
             union_total = 0.0
+            max_batches = 50  # Limit to prevent overfitting
             with torch.no_grad():
-                for imgs, masks in train_loader:
+                for batch_idx, (imgs, masks) in enumerate(train_loader):
+                    if batch_idx >= max_batches:
+                        break
                     imgs, masks = imgs.to(device), masks.to(device)
                     out = func(imgs)
                     out = _align_to_mask(out, masks)
@@ -573,8 +695,39 @@ def evalTrain(toolbox, individual, hof):
             return (dice,)
         else:
             # Standard mIoU fitness
-            _, miou = eval_dataset_miou(toolbox, individual, train_loader, NUM_CLASSES, device=device, ignore_index=IGNORE_INDEX)
-            return (miou,)
+            # ⚠️ CRITICAL: Limit evaluation to subset of train data to prevent overfitting
+            # GP will be evaluated on random subset each generation, forcing generalization
+            _, miou = eval_dataset_miou(toolbox, individual, train_loader, NUM_CLASSES, device=device, ignore_index=IGNORE_INDEX, max_batches=50)
+            
+            # Store base mIoU for logging (without bonuses)
+            individual.base_miou = miou
+            
+            # Apply bonuses if enabled
+            diversity_bonus = 0.0
+            complexity_bonus = 0.0
+            
+            if USE_DIVERSITY_BONUS:
+                # Reward using multiple different model primitives
+                unique_models = set()
+                for node in individual:
+                    if hasattr(node, 'name'):
+                        # Check if this node uses any of our registered models
+                        for model_name in MODELS_TO_USE:
+                            if model_name in str(node.name):
+                                unique_models.add(model_name)
+                diversity_bonus = len(unique_models) * DIVERSITY_BONUS_PER_MODEL
+            
+            if USE_COMPLEXITY_BONUS:
+                # Reward tree complexity (encourages combining primitives)
+                tree_size = len(individual)
+                complexity_bonus = min(MAX_COMPLEXITY_BONUS, tree_size / 200.0)
+            
+            # Store bonus info for debugging
+            individual.diversity_bonus = diversity_bonus
+            individual.complexity_bonus = complexity_bonus
+            
+            total_fitness = miou + diversity_bonus + complexity_bonus
+            return (total_fitness,)
     
     except Exception as e:
         print("Evaluation error (train):", e)
@@ -612,7 +765,11 @@ def GPMain(randomSeeds):
     log = tools.Logbook()
     stats_fit = tools.Statistics(key=lambda ind: ind.fitness.values)
     stats_size_tree = tools.Statistics(key=len)
-    mstats = tools.MultiStatistics(fitness=stats_fit, size_tree=stats_size_tree)
+    
+    # Add statistic to track base mIoU (without bonuses) for clean logging
+    stats_base_miou = tools.Statistics(key=lambda ind: getattr(ind, 'base_miou', ind.fitness.values[0]))
+    
+    mstats = tools.MultiStatistics(fitness=stats_fit, size_tree=stats_size_tree, base_miou=stats_base_miou)
     mstats.register("avg", np.mean)
     mstats.register("std", np.std)
     mstats.register("min", np.min)

@@ -43,19 +43,25 @@ def _to_imshow(img_t):
     # Fallback for unexpected dims: squeeze and recurse
     return _to_imshow(_np.squeeze(arr))
 
-def _colorize_mask(mask_2d: torch.Tensor, k: int):
+def _colorize_mask(mask_2d: torch.Tensor, k: int, exclude_background: bool = False):
     """Colorize a 2D mask tensor of shape (H,W) with k classes into an RGB image.
     Assumes class ids in [0, k-1], with possible ignore index 255.
+    If exclude_background=True, class 0 is colored as black/background.
     Returns a (H,W,3) uint8 NumPy array.
     """   
     m = mask_2d.detach().cpu().numpy().astype(np.int32)
     h, w = m.shape
     out = np.zeros((h, w, 3), dtype=np.uint8)
     
-    # Create palette for k classes (0..k-1)
-    # We use a distinct colormap
-    pal = plt.get_cmap('tab20', max(2, k))
-    pal_rgb = (pal(np.arange(max(2, k)))[:, :3] * 255).astype(np.uint8)
+    # Create palette for k classes
+    # If excluding background, shift colors: class 0 = black, classes 1-k use colormap
+    num_colors = k + 1 if exclude_background else k
+    pal = plt.get_cmap('tab20', max(2, num_colors))
+    pal_rgb = (pal(np.arange(max(2, num_colors)))[:, :3] * 255).astype(np.uint8)
+    
+    # ✅ FIX: Set class 0 (background) to black if excluding
+    if exclude_background:
+        pal_rgb[0] = np.array([0, 0, 0], dtype=np.uint8)
     
     # Identify ignore regions (255)
     ignore_mask = (m == 255)
@@ -154,11 +160,15 @@ def visualize_predictions(toolbox, individual, dataset, num_samples=3, threshold
             pred_with_ignore = pred_indices.clone()
             pred_with_ignore[ignore_pixels] = 255
 
-            pred_mc = _colorize_mask(pred_with_ignore, ncls)
+            # ✅ FIX: Pass exclude_background flag to colormap
+            # When NUM_CLASSES excludes background, predictions are class 0-19 but represent original 1-20
+            # So we need to shift the colormap
+            exclude_bg = True  # Always exclude background from colormap in VOC/COCO/etc.
+            pred_mc = _colorize_mask(pred_with_ignore, ncls, exclude_background=exclude_bg)
             axs[1].imshow(pred_mc)
             axs[1].set_title("Prediction")
 
-            mc = _colorize_mask(gt_mask_for_ignore, ncls)
+            mc = _colorize_mask(gt_mask_for_ignore, ncls, exclude_background=exclude_bg)
             axs[2].imshow(mc); axs[2].set_title("Ground Truth - multiclass")
         else:
             # binary display

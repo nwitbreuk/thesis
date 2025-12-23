@@ -184,6 +184,7 @@ def eval_dataset_miou(
       num_classes: number of classes including background
       device: device string for inference (e.g. 'cuda' or 'cpu')
       ignore_index: label value to ignore (e.g. 255)
+      exclude_background: if True, exclude class 0 from mIoU calculation
       max_batches: if set, limit number of batches to process (useful for fast tests)
 
     Returns:
