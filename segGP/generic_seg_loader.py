@@ -153,8 +153,12 @@ class GeneralSegDataset(Dataset):
         # Keep as indexed/label image; convert to numpy directly
         m_np = np.array(m)
         if m_np.ndim == 3:
-            # If mask accidentally has 3 channels, collapse to single channel via first channel
-            m_np = m_np[..., 0]
+            # Some AOI masks store class IDs only in one channel (often G) while others are identical across channels.
+            # Pick the channel with the most unique non-zero values to recover the label map reliably.
+            chans = [m_np[..., i] for i in range(m_np.shape[2])]
+            uniq_counts = [len(np.unique(c)) for c in chans]
+            best_idx = int(np.argmax(uniq_counts))
+            m_np = chans[best_idx]
         # Ensure dtype small integer
         if m_np.dtype == np.bool_:
             m_np = m_np.astype(np.uint8)

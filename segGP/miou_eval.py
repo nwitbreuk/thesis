@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 
-def _accumulate_confmat(conf: np.ndarray, preds_np: np.ndarray, target_np: np.ndarray, num_classes: int, ignore_index: Optional[int] = None) -> np.ndarray:
+def _accumulate_confmat(conf: np.ndarray, preds_np: np.ndarray, target_np: np.ndarray, num_classes: int, exclude_background: bool = True, ignore_index: Optional[int] = None) -> np.ndarray:
     """Accumulate confusion matrix counts.
 
     conf: (num_classes, num_classes) ndarray to add into (true, pred)
@@ -33,6 +33,8 @@ def _accumulate_confmat(conf: np.ndarray, preds_np: np.ndarray, target_np: np.nd
     mask = np.ones_like(target_np, dtype=bool)
     if ignore_index is not None:
         mask &= (target_np != ignore_index)
+    if exclude_background:
+        mask &= (target_np != 0)  # ✅ Exclude class 0 pixels entirely
     # ensure labels are within [0, num_classes-1]
     mask &= (target_np >= 0) & (target_np < num_classes)
     mask &= (preds_np >= 0) & (preds_np < num_classes)
@@ -171,6 +173,7 @@ def eval_dataset_miou(
         num_classes: int,  
         device: Optional[str] = None, 
         ignore_index: Optional[int] = 255, 
+        exclude_background: bool = True,
         max_batches: Optional[int] = None)-> Tuple[np.ndarray, float]:
     """Evaluate an individual across a DataLoader and return dataset-level IoUs.
 
@@ -181,6 +184,7 @@ def eval_dataset_miou(
       num_classes: number of classes including background
       device: device string for inference (e.g. 'cuda' or 'cpu')
       ignore_index: label value to ignore (e.g. 255)
+      exclude_background: if True, exclude class 0 from mIoU calculation
       max_batches: if set, limit number of batches to process (useful for fast tests)
 
     Returns:
@@ -208,7 +212,11 @@ def eval_dataset_miou(
             # Convert outputs and masks to 1D numpy arrays of ids
             pred_flat, targ_flat = _to_numpy_preds_and_targets(out, masks, num_classes, ignore_index)
             # accumulate confusion
-            _accumulate_confmat(conf, pred_flat, targ_flat, num_classes, ignore_index)
+            conf = _accumulate_confmat(
+                conf, pred_flat, targ_flat, num_classes, 
+                ignore_index=ignore_index,
+                exclude_background=exclude_background
+            )
             processed += 1
 
     ious, miou = confmat_to_iou(conf, exclude_background=(num_classes > 1))

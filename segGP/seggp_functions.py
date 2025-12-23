@@ -8,7 +8,10 @@ import math
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 import os
+import transformations as tf_ops
+import numpy as np
 
 # region ==== Alignment & Helpers functions ====
 
@@ -129,6 +132,105 @@ def _align_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
 
 # endregion
 
+# region ==== Image Transformation Wrappers (OpenCV) ====
+
+def mix_img(a, b, t):
+    # Same as mix but typed for Images
+    return (a * t) + (b * (1.0 - t))
+
+def _tensor_to_cv2(x: torch.Tensor) -> np.ndarray:
+    """Convert (B, C, H, W) float tensor [0,1] to (B, H, W, C) uint8 numpy [0,255]."""
+    # Ensure CPU and channel-last
+    x_np = x.detach().cpu().permute(0, 2, 3, 1).numpy()
+    # Scale and clip
+    x_np = np.clip(x_np * 255.0, 0, 255).astype(np.uint8)
+    return x_np
+
+def _cv2_to_tensor(x_np: np.ndarray, device, original_dtype) -> torch.Tensor:
+    """Convert (B, H, W, C) uint8 numpy [0,255] back to (B, C, H, W) float tensor [0,1]."""
+    if x_np.ndim == 3:
+        x_np = np.expand_dims(x_np, axis=-1)
+    t = torch.from_numpy(x_np).permute(0, 3, 1, 2).to(device)
+    return t.float() / 255.0
+
+# === GPU-optimized transformations using torchvision and custom ops ===
+def img_to_feat(x):
+    # Converts (B, 3, H, W) Image -> (B, 3, H, W) FeatureMap
+    # This allows the GP to perform math (Add/Sub) directly on RGB values
+    return x
+
+
+def trans_bilateral(x, d_norm, sigma_norm):
+    # ⚠️ Bilateral filter has no fast GPU implementation in standard PyTorch.
+    # We keep the slow CPU version here. If speed is critical, remove "Bilateral" from the primitive set.
+    d_val = max(0.0, min(1.0, float(d_norm)))
+    s_val = max(0.0, min(1.0, float(sigma_norm)))
+    
+    d = int(3 + d_val * 6)
+    sigma = 10 + s_val * 90
+    
+    x_cv = _tensor_to_cv2(x)
+    res = tf_ops.apply_bilateral_filter(x_cv, d=d, sigma_color=sigma, sigma_space=sigma) # type: ignore
+    return _cv2_to_tensor(res, x.device, x.dtype)
+
+def trans_blur(x, k_norm):
+    # GPU-optimized Gaussian Blur
+    # Clamp k_norm to [0, 1] to ensure kernel size stays within [3, 21]
+    k_val = max(0.0, min(1.0, float(k_norm)))
+    
+    k = int(3 + k_val * 18) # Map to [3, 21]
+    if k % 2 == 0: k += 1
+    # Sigma heuristic similar to OpenCV
+    sigma = 0.3 * ((k - 1) * 0.5 - 1) + 0.8
+    return TF.gaussian_blur(x, kernel_size=[k, k], sigma=[sigma, sigma])
+
+def trans_sharpen(x, alpha):
+    # GPU-optimized Sharpness
+    a_val = max(0.0, min(1.0, float(alpha)))
+    a = a_val * 4.0 
+    return TF.adjust_sharpness(x, sharpness_factor=a)
+
+def trans_contrast(x, alpha):
+    # GPU-optimized Contrast
+    a_val = max(0.0, min(1.0, float(alpha)))
+    a = 0.2 + a_val * 1.8
+    return TF.adjust_contrast(x, contrast_factor=a)
+
+def trans_gamma(x, gamma):
+    # GPU-optimized Gamma
+    g_val = max(0.0, min(1.0, float(gamma)))
+    g = 0.5 + g_val * 2.0
+    return TF.adjust_gamma(x, gamma=g)
+
+def trans_rotate(x, angle_norm):
+    # GPU-optimized Rotate
+    ang_val = max(0.0, min(1.0, float(angle_norm)))
+    ang = (ang_val - 0.5) * 60.0 # [-30, 30] degrees
+    return TF.rotate(x, angle=ang, interpolation=TF.InterpolationMode.BILINEAR)
+
+def trans_translate(x, tx, ty):
+    # GPU-optimized Affine Translate
+    tx_val = max(0.0, min(1.0, float(tx)))
+    ty_val = max(0.0, min(1.0, float(ty)))
+    
+    shift_x = int((tx_val - 0.5) * 40.0) # [-20, 20] pixels
+    shift_y = int((ty_val - 0.5) * 40.0)
+    return TF.affine(x, angle=0, translate=[shift_x, shift_y], scale=1.0, shear=0) # type: ignore
+
+def trans_brightness(x, delta_norm):
+    # GPU-optimized Brightness
+    d_val = max(0.0, min(1.0, float(delta_norm)))
+    f = 0.5 + d_val # [0.5, 1.5]
+    return TF.adjust_brightness(x, brightness_factor=f) # type: ignore
+
+def trans_solarize(x, thresh_norm):
+    # GPU-optimized Solarize
+    t = float(thresh_norm)
+    t = max(0.0, min(0.99, t))
+    return TF.solarize(x, threshold=t) # type: ignore
+
+# endregion
+
 # region ==== Combination functions ====
 
 def mix(x, y, w: float):
@@ -136,16 +238,29 @@ def mix(x, y, w: float):
     x_al, y_al = _align_pair(x, y)
     return x_al * w + y_al * (1.0 - w)
 
-def if_then_else(cond, a, b):
-    """Select between a and b based on condition tensor, aligning channels as needed."""
-    a_al, b_al = _align_pair(a, b)
-    # cond to 1 channel via mean, then repeat to match target channels
-    cond4 = _as_nchw(cond)
-    Ctarget = _as_nchw(a_al).shape[1]
-    if cond4.shape[1] != 1:
-        cond4 = cond4.mean(dim=1, keepdim=True)
-    cond_al = _repeat_channels(cond4, Ctarget)
-    return cond_al * a_al + (1.0 - cond_al) * b_al
+def if_then_else(cond: torch.Tensor, xa: torch.Tensor, xb: torch.Tensor) -> torch.Tensor:
+    """Elementwise if-else with full channel/spatial alignment."""
+    cin = cond
+    ain = xa
+    bin = xb
+
+    # NCHW
+    c4 = _as_nchw(cond)
+    a4 = _as_nchw(xa)
+    b4 = _as_nchw(xb)
+
+    # Align branches first (channels + spatial)
+    a4, b4 = _align_pair(a4, b4)
+
+    # Condition: single channel, match spatial to branches
+    if c4.shape[1] != 1:
+        c4 = c4.mean(dim=1, keepdim=True)
+    if c4.shape[-2:] != a4.shape[-2:]:
+        c4 = F.interpolate(c4, size=a4.shape[-2:], mode="nearest")
+
+    mask = c4 > 0
+    out = torch.where(mask, a4, b4)
+    return _restore_like(out, ain)
 
 def gaussian_blur_param(x, sigma: float):
     xin = x
@@ -221,6 +336,52 @@ def logical_not(x):
 def logical_xor(x, y):
     xa, ya = _align_pair(x, y)
     return torch.abs(xa - ya)
+
+def clamp_unit(x):
+    # Align not needed; elementwise clamp
+    return torch.clamp(x, 0.0, 1.0)
+
+def bias(x, b: float):
+    # Add scalar bias
+    return x + b
+
+def scale(x, s: float):
+    # Scale by scalar
+    return x * s
+
+def weighted_sum(x, y, w: float):
+    # Align channels/spatial, then convex combine
+    x_al, y_al = _align_pair(x, y)
+    return x_al * w + y_al * (1.0 - w)
+
+def min_tensor(x, y):
+    x_al, y_al = _align_pair(x, y)
+    return torch.minimum(x_al, y_al)
+
+def max_tensor(x, y):
+    x_al, y_al = _align_pair(x, y)
+    return torch.maximum(x_al, y_al)
+
+def softmax_blend(a, b, temp: float = 1.0):
+    """
+    Convex blend of 2 tensors using softmax weights controlled by temperature.
+    Higher temp → more uniform blend, lower temp → more winner-take-all.
+    """
+    # Align the two input tensors
+    a_al, b_al = _align_pair(a, b)
+    
+    # Compute scalar logits from spatial/channel means
+    a4 = _as_nchw(a_al)
+    b4 = _as_nchw(b_al)
+    logit_a = a4.mean().unsqueeze(0)
+    logit_b = b4.mean().unsqueeze(0)
+    
+    logits = torch.stack([logit_a, logit_b]) / max(1e-6, float(temp))
+    weights = torch.softmax(logits, dim=0)
+    
+    # Weighted sum
+    out = a_al * weights[0] + b_al * weights[1]
+    return out
 
 # endregion
 
@@ -416,19 +577,13 @@ def _extract_features_from_model(model: nn.Module, x: torch.Tensor, cache_key: s
                 model.conv5 if hasattr(model, 'conv5') else nn.Identity() # type: ignore
             )
         elif 'deeplabv3' in model_name:
-            # DeepLabV3 backbone returns OrderedDict, wrap to extract the final feature map
-            backbone = model.backbone
-            def wrapped_backbone(x):
-                feats = backbone(x) # type: ignore
-                # feats is OrderedDict with keys like 'out', 'aux', or stage names
-                # Return the highest-resolution feature map (usually 'out' or last entry)
-                if isinstance(feats, dict):
-                    if 'out' in feats:
-                        return feats['out']
-                    # Fallback: return last value in OrderedDict
-                    return list(feats.values())[-1]
-                return feats
-            feat = wrapped_backbone
+            # --- CHANGED: Use the full model to get semantic logits (21 ch) ---
+            # Previous version used model.backbone, which returned 2048 raw features
+            # that were then randomly projected to 32, losing the pretrained semantic knowledge.
+            def wrapped_full_model(x):
+                out = model(x)
+                return out['out'] if isinstance(out, dict) else out
+            feat = wrapped_full_model
         else:
             feat = getattr(model, 'features', model)
         

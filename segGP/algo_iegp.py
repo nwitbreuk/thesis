@@ -10,6 +10,7 @@ import torch
 import matplotlib.pyplot as plt
 from typing import List
 
+from visualize import _colorize_mask
 import seggp_functions as felgp_fs
 from miou_eval import _accumulate_confmat, confmat_to_iou
 from miou_eval import _to_numpy_preds_and_targets  # ✅ import the safe converter
@@ -193,14 +194,14 @@ def eaSimple(population, toolbox, cxpb, mutpb, elitpb, ngen, randomseed, stats=N
 
 # region ===== Baseline: evaluate pretrained_seg_nn without GP =====
 
-def build_segmenter_callable(model_name: str, num_classes: int):
+def build_segmenter_callable(model_name: str, num_classes: int, selected_classes: List[int] | None = None):
     """
     Build a callable(x) -> logits (B,k,H,W) for baseline evaluation using the model registry.
     """
     from model_registry import make_segmenter, MODEL_CONFIGS
     if model_name not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model '{model_name}'")
-    return make_segmenter(model_name, num_classes)
+    return make_segmenter(model_name, num_classes, selected_classes)
 
 def run_baselines_for_models(
     models_to_use: List[str],
@@ -217,6 +218,7 @@ def run_baselines_for_models(
     randomSeeds: int,
     save_visuals: bool = True,
     vis_count: int = 6,
+    params: Optional[Dict[str, Any]] = None, # ✅ Accept params dict
 ) -> dict:
     """
     Orchestrate baseline evaluation across multiple models.
@@ -229,11 +231,30 @@ def run_baselines_for_models(
     run_root, meta = data_handling._make_run_dir(args_ns, dataset_name, randomSeeds)
     data_handling._write_run_info(run_root, meta, args_ns, randomSeeds)
 
+    # ✅ Filter selected classes to remove ignore_index before passing to model builder
+    valid_selected = None
+    if selected_classes:
+        valid_selected = [c for c in selected_classes if c != ignore_index]
+
     baseline_results: dict = {}
     for idx, model_name in enumerate(models_to_use):
         try:
             print(f"\n[Baseline] Evaluating {model_name}...")
-            model_func = build_segmenter_callable(model_name, num_classes)
+            # ✅ Pass valid_selected here
+            model_func = build_segmenter_callable(model_name, num_classes, valid_selected)
+            
+            # Merge passed params with local params
+            run_params = {
+                "Dataset": dataset_name,
+                "RUN_MODE": run_mode,
+                "color_mode": "rgb",
+                "num_classes": num_classes,
+                "selected_classes": selected_classes,
+                "model_name": model_name,
+            }
+            if params:
+                run_params.update(params)
+
             result = run_pretrained_baseline(
                 train_loader=train_loader,
                 test_loader=test_loader,
@@ -245,14 +266,7 @@ def run_baselines_for_models(
                 run_dir=os.path.join(run_root, model_name),
                 dataset_name=dataset_name,
                 randomSeeds=randomSeeds,
-                params={
-                    "Dataset": dataset_name,
-                    "RUN_MODE": run_mode,
-                    "color_mode": "rgb",  # set by caller if needed
-                    "num_classes": num_classes,
-                    "selected_classes": selected_classes,
-                    "model_name": model_name,
-                },
+                params=run_params, # ✅ Pass updated params
                 args=args_ns,
                 meta=meta,
                 copy_slurm_logs=(idx == len(models_to_use) - 1),
@@ -262,6 +276,8 @@ def run_baselines_for_models(
             baseline_results[model_name] = result
         except Exception as e:
             print(f"[Baseline] {model_name} failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Save comparison summary
     comparison_path = os.path.join(run_root, "baseline_comparison.txt")
@@ -270,6 +286,12 @@ def run_baselines_for_models(
         f.write(f"Dataset: {dataset_name}\n")
         f.write(f"Classes: {num_classes} (selected: {selected_classes})\n")
         f.write(f"Metric: {'mIoU' if num_classes > 1 else 'Dice'}\n\n")
+        
+        # ✅ Write class distribution info if available
+        if params and "class_distribution" in params:
+            f.write("=== CLASS DISTRIBUTION ===\n")
+            f.write(f"{params['class_distribution']}\n\n")
+
         for model_name, result in baseline_results.items():
             f.write(f"{model_name}: Train {result['train']['mean']:.4f} | Test {result['test']['mean']:.4f}\n")
     print(f"\n[Baseline] Comparison saved to {comparison_path}")
@@ -344,7 +366,6 @@ def eval_pretrained_on_loader(
         dice = float(total_inter) / float(total_sum) if total_sum > 0.0 else 0.0
         return np.array([dice], dtype=float), dice
 
-
 def run_pretrained_baseline(
     train_loader,
     test_loader,
@@ -363,6 +384,7 @@ def run_pretrained_baseline(
     copy_slurm_logs: bool = True,
     save_visuals: bool = True,
     vis_count: int = 6,
+    IGNORE_INDEX: int = 255,
 ) -> Dict[str, Any]:
     """Run baseline model evaluation on train and test loaders.
     
@@ -410,48 +432,73 @@ def run_pretrained_baseline(
             with torch.no_grad():
                 for imgs, masks in test_loader:
                     imgs = imgs.to(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-                    logits = model_func(imgs)
-                    if num_classes > 1:
-                        preds = logits.argmax(dim=1, keepdim=True).float()
-                        cmap = plt.get_cmap('tab20', max(2, num_classes))
-                    else:
-                        if logits.dim() == 4 and logits.shape[1] > 1:
-                            logits_bin = logits.mean(dim=1, keepdim=True)
-                        else:
-                            logits_bin = logits
-                        probs = torch.sigmoid(logits_bin)
-                        preds = (probs > 0.5).float()
-                        cmap = 'gray'
+                    logits = model_func(imgs)          # (B, C_model, H, W)
 
-                    # Loop samples in this batch
-                    B = imgs.shape[0]
-                    for b in range(B):
+                    # --- Ensure logits are in compact [0..NUM_CLASSES-1] space ---
+                    if logits.dim() == 3:
+                        logits = logits.unsqueeze(0)
+                    if logits.dim() == 2:
+                        logits = logits.unsqueeze(0).unsqueeze(0)
+
+                    C_model = logits.shape[1]
+                    if C_model != num_classes:
+                        # Project or slice to num_classes (like GP feature_to_logits)
+                        logits = felgp_fs._project_channels_cached(logits, num_classes)
+
+                    # multiclass predictions for visualization
+                    probs = torch.softmax(logits, dim=1)
+                    pred_batch = probs.argmax(dim=1)        # (B, H, W)
+
+                    if pred_batch.dim() == 2:
+                        pred_batch = pred_batch.unsqueeze(0)
+                    batch_len = min(pred_batch.shape[0], imgs.shape[0], masks.shape[0])
+
+                    for b in range(batch_len):
                         if saved >= vis_count:
                             break
+                        
                         img_t = imgs[b].detach().cpu()
                         mask_t = masks[b].detach().cpu()
-                        pred_t = preds[b].detach().cpu()
+                        pred_t = pred_batch[b].detach().cpu()
 
                         # Prepare arrays for display
                         img_np = img_t.permute(1,2,0).numpy() if img_t.shape[0] in (1,3,4) else img_t[0].numpy()
                         if img_np.shape[-1] == 1:
                             img_np = img_np.squeeze(-1)
+                        
+                        # Handle mask shape
                         if mask_t.dim() == 3 and mask_t.shape[0] == 1:
-                            mask_np = mask_t.squeeze(0).numpy()
-                        else:
-                            mask_np = mask_t.numpy()
-                        pred_np = pred_t.squeeze(0).numpy()
+                            mask_t = mask_t.squeeze(0)
+                        
+                        # Align prediction spatial dims if needed
+                        if pred_t.shape != mask_t.shape:
+                             pred_t = torch.nn.functional.interpolate(
+                                 pred_t.unsqueeze(0).unsqueeze(0).float(), 
+                                 size=mask_t.shape, 
+                                 mode="nearest"
+                            ).squeeze().long()
 
                         fig, axs = plt.subplots(1, 3, figsize=(9, 3))
                         axs[0].imshow(img_np, cmap='gray' if img_np.ndim==2 else None)
                         axs[0].set_title("Input")
+
                         if num_classes > 1:
-                            axs[1].imshow(pred_np, cmap=cmap, vmin=0, vmax=max(1, num_classes-1))
-                            axs[2].imshow(mask_np, cmap=cmap, vmin=0, vmax=max(1, num_classes-1))
+                            # Mask ignore_index (255) pixels in prediction for fair comparison
+                            # This ensures we don't colorize background as a class if GT says it's ignore
+                            pred_vis = pred_t.clone()
+                            ignore_mask = (mask_t == IGNORE_INDEX)
+                            pred_vis[ignore_mask] = IGNORE_INDEX
+
+                            pred_rgb = _colorize_mask(pred_vis, num_classes)
+                            gt_rgb   = _colorize_mask(mask_t, num_classes)
+                            
+                            axs[1].imshow(pred_rgb)
+                            axs[2].imshow(gt_rgb)
                         else:
-                            axs[1].imshow(pred_np, cmap='gray')
-                            axs[2].imshow(mask_np, cmap='gray')
-                        axs[1].set_title("Prediction")
+                            axs[1].imshow(pred_t.numpy(), cmap='gray')
+                            axs[2].imshow(mask_t.numpy(), cmap='gray')
+
+                        axs[1].set_title(f"Prediction ({model_name})")
                         axs[2].set_title("Ground Truth")
                         for ax in axs:
                             ax.axis('off')
@@ -478,5 +525,3 @@ def run_pretrained_baseline(
         "model_name": model_name,
         "run_dir": run_dir,
     }
-
-# endregion
