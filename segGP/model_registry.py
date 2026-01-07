@@ -296,14 +296,77 @@ def make_segmenter(model_name, num_classes: int, selected_classes: list[int] | N
     # 1. Handle Segmentation Models (DeepLab, Nadia, Custom)
     if is_segmenter:
         if config.get("is_custom", False):
-            felgp_fs.set_custom_model(
-                path=config["path"],
-                model_builder=config.get("builder"),
-                normalize=True,
-                eager_load=True
-            )
+            # Load a DEDICATED model instance per model_name to avoid global singleton clashes
+            # that would make different callables use the last-loaded model.
+            import torch
+            import torch.nn as nn
+            _cached_local = {"model": None}
+
+            def _load_local_model():
+                if _cached_local["model"] is not None:
+                    return _cached_local["model"]
+                path = config.get("path", "")
+                builder = config.get("builder")
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"Custom model file not found for {model_name}: {path}")
+                # Try TorchScript first
+                m = None
+                try:
+                    m = torch.jit.load(path, map_location="cpu")
+                    m.eval()
+                except Exception:
+                    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+                    if isinstance(ckpt, nn.Module):
+                        m = ckpt.eval()
+                    else:
+                        if builder is None:
+                            raise RuntimeError(f"State dict provided but no builder for {model_name}")
+                        m = builder()
+                        sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+                        m.load_state_dict(sd, strict=False)
+                        m.eval()
+                _cached_local["model"] = m # type: ignore
+                return m
+
             def _raw_infer(x):
-                return felgp_fs.custom_model_infer(x, scale=1.0)
+                # Mirror felgp_fs.custom_model_infer, but with this local model instance
+                m = _load_local_model()
+                xin = x
+                x = felgp_fs._as_nchw(x)
+                B, C, H, W = x.shape
+                # Move model to same device as input lazily
+                dev = x.device
+                m = m.to(dev)
+
+                # Adjust input channels to first 4D weight if needed
+                required_c = None
+                for p in m.parameters():
+                    if p.dim() == 4:
+                        required_c = p.shape[1]
+                        break
+                if required_c is not None and C != required_c:
+                    if C == 1 and required_c > 1:
+                        x = x.repeat(1, required_c, 1, 1)
+                    elif C < required_c:
+                        pad_list = [x[:, :1]] * (required_c - C)
+                        x = torch.cat([x] + pad_list, dim=1)
+                    else:
+                        x = x[:, :required_c]
+
+                # Normalize if 3-channel (ImageNet style)
+                if x.shape[1] == 3:
+                    x = (x - felgp_fs._MEAN) / felgp_fs._STD
+
+                y = m(x)
+                if isinstance(y, dict):
+                    for v in y.values():
+                        if torch.is_tensor(v):
+                            y = v
+                            break
+                if isinstance(y, (list, tuple)):
+                    y = y[0]
+                y = felgp_fs._as_nchw(y) # type: ignore
+                return felgp_fs._restore_like(y, xin)
         elif model_name == "deeplabv3_resnet50":
             # Use the specific pretrained function that returns logits
             def _raw_infer(x):
