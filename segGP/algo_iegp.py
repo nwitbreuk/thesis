@@ -279,6 +279,69 @@ def run_baselines_for_models(
             import traceback
             traceback.print_exc()
 
+    # ✅ Evaluate Ensemble Performance (if multiple models)
+    ensemble_result = None
+    if len(models_to_use) > 1:
+        print(f"\n[Baseline] Evaluating ensemble of {len(models_to_use)} models...")
+        try:
+            # Build callable for each model
+            ensemble_funcs = []
+            for model_name in models_to_use:
+                valid_selected = None
+                if selected_classes:
+                    valid_selected = [c for c in selected_classes if c != ignore_index]
+                model_func = build_segmenter_callable(model_name, num_classes, valid_selected)
+                ensemble_funcs.append(model_func)
+
+            # Evaluate ensemble on train and test
+            train_scores = eval_ensemble_on_loader(train_loader, num_classes, ensemble_funcs, device, ignore_index)
+            test_scores  = eval_ensemble_on_loader(test_loader,  num_classes, ensemble_funcs, device, ignore_index)
+
+            train_per, train_mean = train_scores
+            test_per,  test_mean  = test_scores
+            metric_name = "mIoU" if num_classes > 1 else "Dice"
+            print(f"[Baseline Ensemble] Train {metric_name}: {train_mean:.4f} | Test {metric_name}: {test_mean:.4f}")
+
+            ensemble_result = {
+                "train": {"per_class": train_per, "mean": train_mean},
+                "test":  {"per_class": test_per,  "mean": test_mean},
+                "metric": metric_name,
+                "model_name": f"ensemble_{len(models_to_use)}",
+                "models": models_to_use,
+                "run_dir": os.path.join(run_root, "ensemble"),
+            }
+
+            # Save ensemble results
+            ensemble_dir = ensemble_result["run_dir"]
+            os.makedirs(ensemble_dir, exist_ok=True)
+
+            ds_name = dataset_name or params.get("Dataset", "dataset") if params else (dataset_name or "dataset")
+            summary_path = os.path.join(ensemble_dir, f"Summary_on{ds_name}.txt")
+            with open(summary_path, "w") as f:
+                f.write(f"Mode: Baseline (Ensemble)\n")
+                f.write(f"Models: {', '.join(models_to_use)}\n")
+                if params:
+                    f.write(f"RUN_MODE: {params.get('RUN_MODE','n/a')}\n")
+                    f.write(f"color_mode: {params.get('color_mode','n/a')}\n")
+                    f.write(f"num_classes: {params.get('num_classes','n/a')}\n")
+                if randomSeeds is not None:
+                    f.write(f"randomSeeds: {randomSeeds}\n")
+                f.write(f"Metric: {metric_name}\n")
+                f.write(f"Train {metric_name}: {train_mean:.6f}\n")
+                f.write(f"Test  {metric_name}: {test_mean:.6f}\n")
+                if num_classes > 1:
+                    f.write("Per-class IoU (train):\n")
+                    f.write(", ".join([f"{v:.4f}" if np.isfinite(v) else "nan" for v in train_per.tolist()]) + "\n")
+                    f.write("Per-class IoU (test):\n")
+                    f.write(", ".join([f"{v:.4f}" if np.isfinite(v) else "nan" for v in test_per.tolist()]) + "\n")
+
+            print(f"[Baseline] Ensemble results saved to {ensemble_dir}")
+
+        except Exception as e:
+            print(f"[Baseline] Ensemble evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Save comparison summary
     comparison_path = os.path.join(run_root, "baseline_comparison.txt")
     with open(comparison_path, "w") as f:
@@ -292,13 +355,96 @@ def run_baselines_for_models(
             f.write("=== CLASS DISTRIBUTION ===\n")
             f.write(f"{params['class_distribution']}\n\n")
 
+        f.write("=== INDIVIDUAL MODELS ===\n")
         for model_name, result in baseline_results.items():
             f.write(f"{model_name}: Train {result['train']['mean']:.4f} | Test {result['test']['mean']:.4f}\n")
+        
+        # ✅ Write ensemble results if available
+        if ensemble_result:
+            f.write(f"\n=== ENSEMBLE ({len(models_to_use)} models) ===\n")
+            f.write(f"Train {ensemble_result['metric']}: {ensemble_result['train']['mean']:.4f}\n")
+            f.write(f"Test {ensemble_result['metric']}: {ensemble_result['test']['mean']:.4f}\n")
+
     print(f"\n[Baseline] Comparison saved to {comparison_path}")
 
-    return {"results": baseline_results, "run_root": run_root, "meta": meta}
+    return {"results": baseline_results, "ensemble_result": ensemble_result, "run_root": run_root, "meta": meta}
 
 @torch.no_grad()
+def eval_ensemble_on_loader(
+    data_loader,
+    num_classes: int,
+    model_funcs: List[Callable],
+    device: Optional[str] = None,
+    ignore_index: Optional[int] = 255,
+    max_batches: Optional[int] = None,
+) -> Tuple[np.ndarray, float]:
+    """Evaluate an ensemble of model functions via soft averaging on a DataLoader.
+
+    Args:
+      data_loader: yields (images, masks)
+      num_classes: number of classes including background
+      model_funcs: list of callable model functions
+      device: 'cuda' or 'cpu'
+      ignore_index: label to ignore for multiclass
+      max_batches: optional limit for quick tests
+    
+    Returns:
+      (per_class_ious, mean_iou) for multiclass, or (np.array([dice]), dice) for binary
+    """
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    num_classes = int(num_classes)
+
+    if num_classes > 1:
+        conf = np.zeros((num_classes, num_classes), dtype=np.int64)
+    else:
+        total_inter = 0.0
+        total_sum = 0.0
+
+    processed = 0
+
+    for imgs, masks in data_loader:
+        imgs = imgs.to(device)
+        masks = masks.to(device)
+
+        # Collect logits from all models
+        all_logits = []
+        for model_func in model_funcs:
+            logits = model_func(imgs)
+            all_logits.append(logits)
+
+        # Average logits across models (soft ensemble)
+        ensemble_logits = torch.stack(all_logits, dim=0).mean(dim=0)
+
+        # --- Robust conversion and alignment using shared helper ---
+        pred_flat, targ_flat = _to_numpy_preds_and_targets(
+            ensemble_logits, masks, num_classes=num_classes, ignore_index=ignore_index
+        )
+
+        if num_classes > 1:
+            conf = _accumulate_confmat(conf, pred_flat, targ_flat, num_classes=num_classes, ignore_index=ignore_index)
+        else:
+            # Binary Dice (compute from arrays)
+            # pred_flat and targ_flat are 0/1 ints; convert to float arrays
+            p = pred_flat.astype(np.float32)
+            t = targ_flat.astype(np.float32)
+            inter = float((p * t).sum()) * 2.0
+            summ = float((p + t).sum()) + 1e-8
+            total_inter += inter
+            total_sum += summ
+
+        processed += 1
+        if max_batches is not None and processed >= max_batches:
+            break
+
+    if num_classes > 1:
+        ious, miou = confmat_to_iou(conf, exclude_background=(num_classes > 1))
+        return ious, miou
+    else:
+        dice = float(total_inter) / float(total_sum) if total_sum > 0.0 else 0.0
+        return np.array([dice], dtype=float), dice
+
+
 def eval_pretrained_on_loader(
     data_loader,
     num_classes: int,
