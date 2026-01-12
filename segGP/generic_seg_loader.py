@@ -7,6 +7,8 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as F
 
+from BookCode.segGP.test import decode_binary_mask_from_g
+
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 MASK_EXTS = (".png", ".bmp")
@@ -194,3 +196,64 @@ class GeneralSegDataset(Dataset):
     @ignore_index.setter
     def ignore_index(self, val: int) -> None:
         self._ignore_index = int(val)
+
+# Create custom AOI dataset class that decodes bit-packed masks
+class AOIDualLightingDataset(Dataset):
+    """Custom dataset for AOI data with bit-packed multi-label masks."""
+    def __init__(self, img_dir, mask_dir, num_classes=5):
+        self.num_classes = num_classes
+        from pathlib import Path
+        img_path = Path(img_dir)
+        mask_path = Path(mask_dir)
+        
+        valid_exts = {'.bmp', '.png', '.jpg'}
+        all_imgs = {f.stem: f for f in img_path.iterdir() if f.suffix.lower() in valid_exts}
+        
+        self.pairs = []
+        for mf in mask_path.iterdir():
+            if mf.suffix.lower() not in valid_exts:
+                continue
+            stem = mf.stem
+            # Match buffer00 naming
+            img0_name = stem
+            img1_name = stem.replace("buffer00", "buffer01")
+            
+            if img0_name in all_imgs:
+                img0 = all_imgs[img0_name]
+                img1 = all_imgs.get(img1_name, img0)
+                self.pairs.append((img0, img1, mf))
+    
+    def __len__(self):
+        return len(self.pairs)
+    
+    def __getitem__(self, idx):
+        img0_path, img1_path, mask_path = self.pairs[idx]
+        
+        # Load dual-channel grayscale
+        i0 = np.array(Image.open(img0_path).convert("L"), dtype=np.float32) / 255.0
+        i1 = np.array(Image.open(img1_path).convert("L"), dtype=np.float32) / 255.0
+        img = torch.from_numpy(np.stack([i0, i1], axis=0)).float()
+        
+        # Load and decode bit-packed mask from G channel
+        m_img = Image.open(mask_path).convert("RGB")
+        mask_np = np.array(m_img)
+        binary_mask_np = decode_binary_mask_from_g(mask_np, num_classes=self.num_classes)
+        mask = torch.from_numpy(binary_mask_np.transpose(2, 0, 1)).float()
+        
+        return img, mask
+
+class DualChannelWrapper:
+    """Convert 1-channel grayscale to 2-channel by duplication."""
+    def __init__(self, dataset):
+        self.dataset = dataset
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        img, mask = self.dataset[idx]
+        # img shape: (1, H, W)
+        if img.shape[0] == 1:
+            # Duplicate grayscale to 2 channels
+            img = img.repeat(2, 1, 1)
+        return img, mask

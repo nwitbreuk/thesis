@@ -219,6 +219,8 @@ def run_baselines_for_models(
     save_visuals: bool = True,
     vis_count: int = 6,
     params: Optional[Dict[str, Any]] = None, # ✅ Accept params dict
+    exclude_background: bool = True,
+    background_class: int = 0,
 ) -> dict:
     """
     Orchestrate baseline evaluation across multiple models.
@@ -272,6 +274,8 @@ def run_baselines_for_models(
                 copy_slurm_logs=(idx == len(models_to_use) - 1),
                 save_visuals=save_visuals,
                 vis_count=vis_count,
+                background_class=background_class,
+                exclude_background=exclude_background,
             )
             baseline_results[model_name] = result
         except Exception as e:
@@ -294,8 +298,8 @@ def run_baselines_for_models(
                 ensemble_funcs.append(model_func)
 
             # Evaluate ensemble on train and test
-            train_scores = eval_ensemble_on_loader(train_loader, num_classes, ensemble_funcs, device, ignore_index)
-            test_scores  = eval_ensemble_on_loader(test_loader,  num_classes, ensemble_funcs, device, ignore_index)
+            train_scores = eval_ensemble_on_loader(train_loader, num_classes, ensemble_funcs, device, ignore_index, exclude_background=exclude_background, background_class=background_class)
+            test_scores  = eval_ensemble_on_loader(test_loader,  num_classes, ensemble_funcs, device, ignore_index, exclude_background=exclude_background, background_class=background_class)
 
             train_per, train_mean = train_scores
             test_per,  test_mean  = test_scores
@@ -377,6 +381,8 @@ def eval_ensemble_on_loader(
     device: Optional[str] = None,
     ignore_index: Optional[int] = 255,
     max_batches: Optional[int] = None,
+    exclude_background: bool = True,
+    background_class: int = 0,
 ) -> Tuple[np.ndarray, float]:
     """Evaluate an ensemble of model functions via soft averaging on a DataLoader.
 
@@ -387,6 +393,8 @@ def eval_ensemble_on_loader(
       device: 'cuda' or 'cpu'
       ignore_index: label to ignore for multiclass
       max_batches: optional limit for quick tests
+      exclude_background: whether to exclude background class in evaluation
+      background_class: index of the background class (default: 0)
     
     Returns:
       (per_class_ious, mean_iou) for multiclass, or (np.array([dice]), dice) for binary
@@ -420,9 +428,12 @@ def eval_ensemble_on_loader(
         pred_flat, targ_flat = _to_numpy_preds_and_targets(
             ensemble_logits, masks, num_classes=num_classes, ignore_index=ignore_index
         )
-
         if num_classes > 1:
-            conf = _accumulate_confmat(conf, pred_flat, targ_flat, num_classes=num_classes, ignore_index=ignore_index)
+            conf = _accumulate_confmat(
+                conf, pred_flat, targ_flat, num_classes=num_classes,
+                ignore_index=ignore_index, exclude_background=exclude_background,
+                background_class=background_class
+            )
         else:
             # Binary Dice (compute from arrays)
             # pred_flat and targ_flat are 0/1 ints; convert to float arrays
@@ -438,13 +449,14 @@ def eval_ensemble_on_loader(
             break
 
     if num_classes > 1:
-        ious, miou = confmat_to_iou(conf, exclude_background=(num_classes > 1))
+        ious, miou = confmat_to_iou(conf, exclude_background=exclude_background, background_class=background_class)
         return ious, miou
     else:
         dice = float(total_inter) / float(total_sum) if total_sum > 0.0 else 0.0
         return np.array([dice], dtype=float), dice
 
 
+@torch.no_grad()
 def eval_pretrained_on_loader(
     data_loader,
     num_classes: int,
@@ -452,6 +464,8 @@ def eval_pretrained_on_loader(
     device: Optional[str] = None,
     ignore_index: Optional[int] = 255,
     max_batches: Optional[int] = None,
+    exclude_background: bool = True,
+    background_class: int = 0,
 ) -> Tuple[np.ndarray, float]:
     """Evaluate a model function directly on a DataLoader.
 
@@ -462,6 +476,8 @@ def eval_pretrained_on_loader(
       device: 'cuda' or 'cpu'
       ignore_index: label to ignore for multiclass
       max_batches: optional limit for quick tests
+      exclude_background: whether to exclude background class in evaluation
+      background_class: index of the background class (default: 0)
     
     Returns:
       (per_class_ious, mean_iou) for multiclass, or (np.array([dice]), dice) for binary
@@ -488,9 +504,12 @@ def eval_pretrained_on_loader(
         pred_flat, targ_flat = _to_numpy_preds_and_targets(
             logits, masks, num_classes=num_classes, ignore_index=ignore_index
         )
-
         if num_classes > 1:
-            conf = _accumulate_confmat(conf, pred_flat, targ_flat, num_classes=num_classes, ignore_index=ignore_index)
+            conf = _accumulate_confmat(
+                conf, pred_flat, targ_flat, num_classes=num_classes,
+                ignore_index=ignore_index, exclude_background=exclude_background,
+                background_class=background_class
+            )
         else:
             # Binary Dice (compute from arrays)
             # pred_flat and targ_flat are 0/1 ints; convert to float arrays
@@ -506,7 +525,7 @@ def eval_pretrained_on_loader(
             break
 
     if num_classes > 1:
-        ious, miou = confmat_to_iou(conf, exclude_background=(num_classes > 1))
+        ious, miou = confmat_to_iou(conf, exclude_background=exclude_background, background_class=background_class)
         return ious, miou
     else:
         dice = float(total_inter) / float(total_sum) if total_sum > 0.0 else 0.0
@@ -531,6 +550,8 @@ def run_pretrained_baseline(
     save_visuals: bool = True,
     vis_count: int = 6,
     IGNORE_INDEX: int = 255,
+    background_class: int = 0,
+    exclude_background: bool = True,
 ) -> Dict[str, Any]:
     """Run baseline model evaluation on train and test loaders.
     
@@ -538,8 +559,8 @@ def run_pretrained_baseline(
         model_func: Callable that takes images and returns logits
         model_name: Name of the model for logging purposes
     """
-    train_scores = eval_pretrained_on_loader(train_loader, num_classes, model_func, device, ignore_index, max_batches)
-    test_scores  = eval_pretrained_on_loader(test_loader,  num_classes, model_func, device, ignore_index, max_batches)
+    train_scores = eval_pretrained_on_loader(train_loader, num_classes, model_func, device, ignore_index, max_batches, exclude_background=exclude_background, background_class=background_class)
+    test_scores  = eval_pretrained_on_loader(test_loader,  num_classes, model_func, device, ignore_index, max_batches, exclude_background=exclude_background, background_class=background_class)
 
     train_per, train_mean = train_scores
     test_per,  test_mean  = test_scores
@@ -635,8 +656,8 @@ def run_pretrained_baseline(
                             ignore_mask = (mask_t == IGNORE_INDEX)
                             pred_vis[ignore_mask] = IGNORE_INDEX
 
-                            pred_rgb = _colorize_mask(pred_vis, num_classes)
-                            gt_rgb   = _colorize_mask(mask_t, num_classes)
+                            pred_rgb = _colorize_mask(pred_vis, num_classes, exclude_background=True)
+                            gt_rgb   = _colorize_mask(mask_t, num_classes, exclude_background=True)
                             
                             axs[1].imshow(pred_rgb)
                             axs[2].imshow(gt_rgb)

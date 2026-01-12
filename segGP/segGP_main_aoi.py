@@ -34,13 +34,11 @@ logging.getLogger("torchvision").setLevel(logging.ERROR)
 
 
 # User-configurable options
-COLOR_MODE = "rgb"
-DATASET = "mitsumi"
-BASELINE_ONLY = True
-INCLUDE_TRANSFORMS = True
-RUN_MODE = "aoi_normal"
-# NEW: metric mode (auto detects from DATASET)
-METRIC_MODE = "auto"  # options: "auto", "aoi", "multiclass"
+COLOR_MODE = "rgb"  # "rgb" or "gray"
+DATASET = "mitsumi" # "voc" , "mitsumi", "log_furex", "hikvision"
+BASELINE_ONLY = True # run only the pretrained NN and exit
+INCLUDE_TRANSFORMS = True  # set False to exclude transformation functions from the primitive set
+RUN_MODE = "aoi_normal"  # "fast", "middle", "normal" or "aoi_fast", "aoi_normal", "long"
 AUGMENTATION_SEED = 12  # Seed for data augmentation randomness
 randomSeeds = 12  # Change seed for different evolution paths
 Run_title_SUFFIX = ""  # Optional suffix for run name
@@ -111,22 +109,14 @@ creator.Individual: Any  # type: ignore
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Infer number of classes from dataset selection
-if DATASET == ('voc', 'voc_test'):
+if DATASET == 'voc':
     inferred_classes = 21
 elif DATASET == 'coco':
     inferred_classes = 80
-elif DATASET in ('aoi', 'mitsumi', 'log_furex', 'hikvision'):
+elif DATASET == 'aoi':
     inferred_classes = 5
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
-
-# Decide which metric to use
-if METRIC_MODE == "aoi":
-    _USE_AOI_METRIC = True
-elif METRIC_MODE == "multiclass":
-    _USE_AOI_METRIC = False
-else:
-    _USE_AOI_METRIC = DATASET in ('aoi', 'mitsumi', 'log_furex', 'hikvision')
 
 # Resolve NUM_CLASSES based on selected classes and override
 if SELECTED_CLASSES and len(SELECTED_CLASSES) > 0:
@@ -695,65 +685,13 @@ def _multiclass_preds(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch
     preds = probs.argmax(dim=1)  # (B,H,W)
     return preds, probs
 
-def _confmat_iou_from_logits(logits: torch.Tensor,
-                             masks: torch.Tensor,
-                             num_classes: int,
-                             ignore_index: int,
-                             exclude_background: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    VOC/COCO-style: logits->softmax->argmax, confusion-matrix IoU.
-    Returns per-class IoU and a boolean tensor 'present_in_gt' (classes seen in GT).
-    """
-    # Align and cast
-    if masks.dim() == 4 and masks.shape[1] > 1:
-        # if masks are one-hot by accident, reduce to argmax
-        masks = masks.argmax(dim=1)
-    elif masks.dim() == 4:
-        masks = masks.squeeze(1)
-    preds, _ = _multiclass_preds(logits, num_classes)  # (B,H,W)
-
-    # Flatten valid pixels
-    valid = masks != ignore_index
-    if exclude_background:
-        valid = valid & (masks != 0)
-
-    if valid.sum() == 0:
-        iou = torch.zeros(num_classes, device=logits.device)
-        present = torch.zeros(num_classes, dtype=torch.bool, device=logits.device)
-        return iou, present
-
-    gt = masks[valid].long()
-    pd = preds[valid].long()
-
-    # bincount confusion matrix
-    cm = torch.bincount(
-        gt * num_classes + pd, minlength=num_classes * num_classes
-    ).reshape(num_classes, num_classes).float()
-
-    # background exclusion (set row/col to zero so it contributes nothing)
-    if exclude_background and 0 < num_classes:
-        cm[0, :] = 0
-        cm[:, 0] = 0
-
-    tp = torch.diag(cm)
-    fp = cm.sum(0) - tp
-    fn = cm.sum(1) - tp
-    denom = tp + fp + fn
-    iou = torch.zeros_like(denom)
-    valid_cls = denom > 0
-    iou[valid_cls] = tp[valid_cls] / denom[valid_cls]
-
-    present_in_gt = cm.sum(1) > 0
-    if exclude_background and 0 < num_classes:
-        present_in_gt[0] = False
-    return iou, present_in_gt
-
 def evalTrain(toolbox, individual, hof):
     for h in (hof or []):
         if individual == h:
             return h.fitness.values
     try:
         func = toolbox.compile(expr=individual)
+        
         if NUM_CLASSES == 1:
             # Binary Dice fitness
             inter_total = 0.0
@@ -778,81 +716,58 @@ def evalTrain(toolbox, individual, hof):
             dice = (2.0 * inter_total / (union_total + 1e-6)) if union_total > 0 else 0.0
             return (dice,)
         else:
-            if _USE_AOI_METRIC:
-                # ===== AOI metric (multi-label, sigmoid, present-classes only) =====
-                max_batches = 50
-                total_iou_intersection = torch.zeros(NUM_CLASSES).to(device)
-                total_iou_union = torch.zeros(NUM_CLASSES).to(device)
-                total_acc_valid = torch.zeros(NUM_CLASSES).to(device)
-                total_iou_valid = torch.zeros(NUM_CLASSES).to(device)
-
-                with torch.no_grad():
-                    for batch_idx, (imgs, masks) in enumerate(train_loader):
-                        if batch_idx >= max_batches:
-                            break
-                        imgs = imgs.to(device)
-                        masks = masks.to(device)  # (B,C,H,W) binary
-                        try:
-                            out = func(imgs)
-                            out = _align_to_mask(out, masks)  # (B,C?,H,W)
-                            out = _ensure_k_channels(out, NUM_CLASSES)
-                            probs = torch.sigmoid(out)
-                            preds = (probs > 0.5).float()
-
-                            preds_bool = preds.bool().float()
-                            masks_bool = masks.bool().float()
-                            intersection = (masks_bool * preds_bool).sum(dim=(0, 2, 3))
-                            union = ((masks_bool + preds_bool) > 0).sum(dim=(0, 2, 3)).float()
-                            acc_valid = masks_bool.sum(dim=(0, 2, 3)) > 0
-                            iou_valid = (masks_bool.sum(dim=(0, 2, 3)) + preds_bool.sum(dim=(0, 2, 3))) > 0
-
-                            iou_per_class = torch.zeros_like(intersection)
-                            valid_union = union > 0
-                            iou_per_class[valid_union] = intersection[valid_union] / union[valid_union]
-
-                            total_iou_intersection += iou_per_class * (iou_valid.float())
-                            total_iou_union += iou_valid.float()
-                            total_acc_valid += acc_valid.float()
-                            total_iou_valid += iou_valid.float()
-                        except Exception:
-                            continue
-
-                per_class_iou = torch.zeros(NUM_CLASSES).to(device)
-                for c in range(NUM_CLASSES):
-                    if total_iou_union[c] > 0:
-                        per_class_iou[c] = total_iou_intersection[c] / total_iou_union[c]
-                miou_present = per_class_iou[total_acc_valid > 0].mean().item() if (total_acc_valid > 0).sum() > 0 else 0.0
-            else:
-                # ===== VOC/COCO metric (multiclass, softmax+argmax, present-classes in GT) =====
-                max_batches = 50
-                iou_sum = torch.zeros(NUM_CLASSES, device=device)
-                present_sum = torch.zeros(NUM_CLASSES, dtype=torch.bool, device=device)
-
-                with torch.no_grad():
-                    for batch_idx, (imgs, masks) in enumerate(train_loader):
-                        if batch_idx >= max_batches:
-                            break
-                        imgs = imgs.to(device)
-                        masks = masks.to(device)  # (B,H,W) index with ignore
-                        try:
-                            out = func(imgs)
-                            out = _align_to_mask(out, masks.unsqueeze(1))  # align to (B,1,H,W)
-                            out = _ensure_k_channels(out, NUM_CLASSES)
-                            iou_vec, present_vec = _confmat_iou_from_logits(
-                                out, masks, NUM_CLASSES, IGNORE_INDEX, EXCLUDE_BACKGROUND # type: ignore
-                            )
-                            iou_sum += iou_vec
-                            present_sum |= present_vec
-                        except Exception:
-                            continue
-
-                valid_cls = present_sum
-                if valid_cls.any():
-                    miou_present = (iou_sum[valid_cls].mean()).item()
-                else:
-                    miou_present = 0.0
-
+            # ✅ AOI: mIoU fitness (only classes present in GT)
+            max_batches = 50
+            total_iou_intersection = torch.zeros(NUM_CLASSES).to(device)
+            total_iou_union = torch.zeros(NUM_CLASSES).to(device)
+            total_acc_valid = torch.zeros(NUM_CLASSES).to(device)
+            total_iou_valid = torch.zeros(NUM_CLASSES).to(device)
+            
+            with torch.no_grad():
+                for batch_idx, (imgs, masks) in enumerate(train_loader):
+                    if batch_idx >= max_batches:
+                        break
+                    imgs = imgs.to(device)
+                    masks = masks.to(device)
+                    try:
+                        out = func(imgs)
+                        out = _align_to_mask(out, masks)
+                        
+                        # Threshold for binary masks
+                        probs = torch.sigmoid(out)
+                        preds = (probs > 0.5).float()
+                        
+                        # Compute IoU components per class
+                        preds_bool = preds.bool().float()
+                        masks_bool = masks.bool().float()
+                        intersection = (masks_bool * preds_bool).sum(dim=(0, 2, 3))
+                        union = ((masks_bool + preds_bool) > 0).sum(dim=(0, 2, 3)).float()
+                        acc_valid = masks_bool.sum(dim=(0, 2, 3)) > 0
+                        iou_valid = (masks_bool.sum(dim=(0, 2, 3)) + preds_bool.sum(dim=(0, 2, 3))) > 0
+                        
+                        # Accumulate
+                        iou_per_class = torch.zeros_like(intersection)
+                        valid_union = union > 0
+                        iou_per_class[valid_union] = intersection[valid_union] / union[valid_union]
+                        
+                        total_iou_intersection += iou_per_class * (iou_valid.float())
+                        total_iou_union += iou_valid.float()
+                        total_acc_valid += acc_valid.float()
+                        total_iou_valid += iou_valid.float()
+                    except Exception as e:
+                        continue
+            
+            # Compute mIoU only over classes present in GT
+            per_class_iou = torch.zeros(NUM_CLASSES).to(device)
+            for c in range(NUM_CLASSES):
+                if total_iou_union[c] > 0:
+                    per_class_iou[c] = total_iou_intersection[c] / total_iou_union[c]
+            
+            # ✅ KEY: Average only over classes present in GT
+            miou_present = per_class_iou[total_acc_valid > 0].mean().item() if (total_acc_valid > 0).sum() > 0 else 0.0
+            
             individual.base_miou = miou_present
+            
             # Apply bonuses if enabled
             diversity_bonus = 0.0
             complexity_bonus = 0.0
@@ -873,6 +788,7 @@ def evalTrain(toolbox, individual, hof):
             
             total_fitness = miou_present + diversity_bonus + complexity_bonus
             return (total_fitness,)
+    
     except Exception as e:
         print("Evaluation error (train):", e)
         return (0.0,)
@@ -959,35 +875,37 @@ def evalTest(toolbox, individual, test_loader):
             total_iou_intersection = torch.zeros(NUM_CLASSES).to(device)
             total_acc_valid = torch.zeros(NUM_CLASSES).to(device)
             total_iou_union = torch.zeros(NUM_CLASSES).to(device)
-
+            total_iou_valid = torch.zeros(NUM_CLASSES).to(device)
+            
             with torch.no_grad():
                 for imgs, masks in test_loader:
                     imgs = imgs.to(device)
                     masks = masks.to(device)
                     out = func(imgs)
                     out = _align_to_mask(out, masks)
-                    out = _ensure_k_channels(out, NUM_CLASSES)
                     probs = torch.sigmoid(out)
                     preds = (probs > 0.5).float()
-
+                    
                     preds_bool = preds.bool().float()
                     masks_bool = masks.bool().float()
                     intersection = (masks_bool * preds_bool).sum(dim=(0, 2, 3))
                     union = ((masks_bool + preds_bool) > 0).sum(dim=(0, 2, 3)).float()
                     acc_valid = masks_bool.sum(dim=(0, 2, 3)) > 0
-
+                    iou_valid = (masks_bool.sum(dim=(0, 2, 3)) + preds_bool.sum(dim=(0, 2, 3))) > 0
+                    
                     iou_per_class = torch.zeros_like(intersection)
                     valid_union = union > 0
                     iou_per_class[valid_union] = intersection[valid_union] / union[valid_union]
-
-                    total_iou_intersection += iou_per_class * (valid_union.float())
-                    total_iou_union += valid_union.float()
+                    
+                    total_iou_intersection += iou_per_class * (iou_valid.float())
                     total_acc_valid += acc_valid.float()
-
+                    total_iou_valid += iou_valid.float()
+            
             per_class_iou = torch.zeros(NUM_CLASSES).to(device)
             for c in range(NUM_CLASSES):
                 if total_iou_union[c] > 0:
                     per_class_iou[c] = total_iou_intersection[c] / total_iou_union[c]
+            
             miou_test = per_class_iou[total_acc_valid > 0].mean().item() if (total_acc_valid > 0).sum() > 0 else 0.0
             return miou_test
     except Exception as e:

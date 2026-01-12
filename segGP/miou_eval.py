@@ -21,12 +21,13 @@ import numpy as np
 import torch
 
 
-def _accumulate_confmat(conf: np.ndarray, preds_np: np.ndarray, target_np: np.ndarray, num_classes: int, exclude_background: bool = True, ignore_index: Optional[int] = None) -> np.ndarray:
+def _accumulate_confmat(conf: np.ndarray, preds_np: np.ndarray, target_np: np.ndarray, num_classes: int, exclude_background: bool = True, ignore_index: Optional[int] = None, background_class: int = 0) -> np.ndarray:
     """Accumulate confusion matrix counts.
 
     conf: (num_classes, num_classes) ndarray to add into (true, pred)
     preds_np, target_np: 1D numpy arrays of same length
     ignore_index: if given, pixels with target == ignore_index are skipped
+    background_class: which class to exclude if exclude_background=True (default 0)
     Returns the updated conf (the same array object is modified).
     """
     # build mask to select valid pixels
@@ -34,7 +35,7 @@ def _accumulate_confmat(conf: np.ndarray, preds_np: np.ndarray, target_np: np.nd
     if ignore_index is not None:
         mask &= (target_np != ignore_index)
     if exclude_background:
-        mask &= (target_np != 0)  # ✅ Exclude class 0 pixels entirely
+        mask &= (target_np != background_class)  # Exclude specified background class
     # ensure labels are within [0, num_classes-1]
     mask &= (target_np >= 0) & (target_np < num_classes)
     mask &= (preds_np >= 0) & (preds_np < num_classes)
@@ -49,11 +50,12 @@ def _accumulate_confmat(conf: np.ndarray, preds_np: np.ndarray, target_np: np.nd
     return conf
 
 
-def confmat_to_iou(conf: np.ndarray, exclude_background: bool = True) -> Tuple[np.ndarray, float]:
+def confmat_to_iou(conf: np.ndarray, exclude_background: bool = True, background_class: int = 0) -> Tuple[np.ndarray, float]:
     """Compute per-class IoU and mean IoU from confusion matrix.
 
     conf: (C,C) ndarray where conf[true, pred] = pixel counts
-    exclude_background: if True and C>1, exclude class 0 from mean mIoU
+    exclude_background: if True and C>1, exclude background_class from mean mIoU
+    background_class: which class to exclude (default 0)
     Returns: (ious_array_of_length_C, mean_iou)
     """
     C = conf.shape[0]
@@ -68,7 +70,10 @@ def confmat_to_iou(conf: np.ndarray, exclude_background: bool = True) -> Tuple[n
         else:
             ious[c] = np.nan
     if exclude_background and C > 1:
-        vals = ious[1:]
+        # Exclude the specified background class from mean
+        mask = np.ones(C, dtype=bool)
+        mask[background_class] = False
+        vals = ious[mask]
     else:
         vals = ious
     if np.all(np.isnan(vals)):
@@ -174,7 +179,8 @@ def eval_dataset_miou(
         device: Optional[str] = None, 
         ignore_index: Optional[int] = 255, 
         exclude_background: bool = True,
-        max_batches: Optional[int] = None)-> Tuple[np.ndarray, float]:
+        max_batches: Optional[int] = None,
+        background_class: int = 0)-> Tuple[np.ndarray, float]:
     """Evaluate an individual across a DataLoader and return dataset-level IoUs.
 
     Args:
@@ -215,11 +221,12 @@ def eval_dataset_miou(
             conf = _accumulate_confmat(
                 conf, pred_flat, targ_flat, num_classes, 
                 ignore_index=ignore_index,
-                exclude_background=exclude_background
+                exclude_background=exclude_background,
+                background_class=background_class
             )
             processed += 1
 
-    ious, miou = confmat_to_iou(conf, exclude_background=(num_classes > 1))
+    ious, miou = confmat_to_iou(conf, exclude_background=exclude_background, background_class=background_class)
     return ious, miou
 
 

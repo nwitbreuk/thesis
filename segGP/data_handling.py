@@ -40,6 +40,13 @@ def _set_global_seeds(seed: int):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
+def decode_binary_mask_from_g(mask_rgb: np.ndarray, num_classes: int = 5) -> np.ndarray:
+    """Decode multi-label mask from G channel LSBs (matches training encoding)."""
+    g = mask_rgb[..., 1].astype(np.uint8)
+    # Unpack LSBs: (H, W) -> (H, W, 8) -> take first num_classes
+    bits = np.unpackbits(g[..., None], axis=-1, bitorder="little")[..., :num_classes]
+    return bits
+
 def pad_collate(batch):
     """
     Collate function to pad images and masks in a batch to the same size.

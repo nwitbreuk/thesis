@@ -5,8 +5,15 @@ Add new models here without modifying segGP_main.py.
 import os
 import torch
 import torch.nn as nn
-from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights, deeplabv3_mobilenet_v3_large
-from torchvision.models import mobilenet_v3_small, mobilenet_v3_large, resnet18, resnet50, efficientnet_b0, MobileNet_V3_Large_Weights
+from torchvision.models.segmentation import (
+    deeplabv3_resnet50, DeepLabV3_ResNet50_Weights,
+    deeplabv3_resnet101, DeepLabV3_ResNet101_Weights,
+    deeplabv3_mobilenet_v3_large, 
+    fcn_resnet50, FCN_ResNet50_Weights,
+    lraspp_mobilenet_v3_large, LRASPP_MobileNet_V3_Large_Weights # type: ignore
+)
+from torchvision.models import mobilenet_v3_small, mobilenet_v3_large, resnet18, resnet50, resnet34, efficientnet_b0, MobileNet_V3_Large_Weights
+import segmentation_models_pytorch as smp # type: ignore
 import seggp_functions as felgp_fs
 
 def _build_nadia_model(model_name):
@@ -39,35 +46,29 @@ MODEL_CONFIGS = {
         "is_segmenter": True,  # ✅ Mark as a full segmentation model
         "description": "DeepLabV3 with ResNet-50 backbone (default)"
     },
-    "shufflenet_v2_x1_0": {
-        "builder": lambda: torch.hub.load('pytorch/vision:v0.10.0', 'shufflenet_v2_x1_0', weights = 'DEFAULT'),
+    "deeplabv3_resnet101": {
+        "builder": lambda: deeplabv3_resnet101(weights=DeepLabV3_ResNet101_Weights.DEFAULT),
         "feature_extractor": True,
-        "is_segmenter": False,
-        "description": "ShuffleNetV2-x1.0 (lightweight)"
+        "is_segmenter": True,
+        "description": "DeepLabV3 with ResNet-101 backbone (higher-capacity variant)"
     },
-    "resnet18": {
-        "builder": lambda: resnet18(weights='DEFAULT'),
+    "fcn_resnet50": {
+        "builder": lambda: fcn_resnet50(weights=FCN_ResNet50_Weights.DEFAULT),
         "feature_extractor": True,
-        "is_segmenter": False,
-        "description": "ResNet-18 feature extractor"
+        "is_segmenter": True,
+        "description": "FCN with ResNet-50 backbone (different decoder, simpler)"
     },
-    "resnet50": {
-        "builder": lambda: resnet50(weights='DEFAULT'),
+    "lraspp_mobilenet_v3_large": {
+        "builder": lambda: lraspp_mobilenet_v3_large(weights=LRASPP_MobileNet_V3_Large_Weights.DEFAULT),
         "feature_extractor": True,
-        "is_segmenter": False,
-        "description": "ResNet-50 feature extractor"
+        "is_segmenter": True,
+        "description": "LR-ASPP with MobileNetV3-Large backbone (lightweight segmentation)"
     },
-    "mobilenet_v3_small": {
-        "builder": lambda: mobilenet_v3_small(weights='DEFAULT'),
+    "unet_resnet34": {
+        "builder": lambda: smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=3, classes=21),
         "feature_extractor": True,
-        "is_segmenter": False,
-        "description": "MobileNetV3-Small (lightweight)"
-    },
-    "efficientnet_b0": {
-        "builder": lambda: efficientnet_b0(weights='DEFAULT'),
-        "feature_extractor": True,
-        "is_segmenter": False,
-        "description": "EfficientNet-B0"
+        "is_segmenter": True,
+        "description": "UNet with ResNet-34 encoder"
     },
     "aoi_1": {
         "path": "/dataB1/aoi/benchmarks/model_library/ensemble_models/v2/ensemble_model_1.pth",
@@ -267,25 +268,7 @@ def make_feat_extractor(model_name):
 
 def make_segmenter(model_name, num_classes: int, selected_classes: list[int] | None = None):
     """
-     Return a callable(x) -> logits (B, k, H, W) for baseline evaluation.
-    
-     Args:
-          model_name: Model identifier from MODEL_CONFIGS
-          num_classes: Number of output classes (k)
-          selected_classes: Optional list of class IDs to select (e.g., [15, 8, 12] for VOC)
-    
-     Behavior:
-     1. VOC/Nadia models (21 output channels):
-         - Without selection: returns all 21 channels (or projects if k != 21)
-         - With selection [15,8,12]: slices channels 15,8,12 -> returns 3 channels [0,1,2]
-       
-     2. AOI models (5 output channels):
-         - Already trained on remapped data [0,1,2,3,4]
-         - Returns output as-is (no slicing needed)
-       
-     3. Feature extractors (backbones only):
-         - Adds a random conv head to project features -> k channels
-         - Baseline performance will be poor (random)
+    Return a callable(x) -> logits (B, k, H, W) for baseline evaluation.
     """
     import seggp_functions as felgp_fs
 
@@ -293,7 +276,7 @@ def make_segmenter(model_name, num_classes: int, selected_classes: list[int] | N
     k = int(num_classes)
     is_segmenter = config.get("is_segmenter", False)
 
-    # 1. Handle Segmentation Models (DeepLab, Nadia, Custom)
+    # 1. Handle Segmentation Models
     if is_segmenter:
         if config.get("is_custom", False):
             # Load a DEDICATED model instance per model_name to avoid global singleton clashes
@@ -367,14 +350,48 @@ def make_segmenter(model_name, num_classes: int, selected_classes: list[int] | N
                     y = y[0]
                 y = felgp_fs._as_nchw(y) # type: ignore
                 return felgp_fs._restore_like(y, xin)
-        elif model_name == "deeplabv3_resnet50":
-            # Use the specific pretrained function that returns logits
-            def _raw_infer(x):
-                return felgp_fs.pretrained_seg_nn(x)
         else:
-            # Fallback for other segmenters if added
-            feat_fn = make_feat_extractor(model_name)
-            _raw_infer = feat_fn
+            # ✅ NEW: Generic handler for ALL pretrained segmentation models
+            _cached_model = {"model": None}
+            
+            def _load_model():
+                if _cached_model["model"] is not None:
+                    return _cached_model["model"]
+                
+                builder = config.get("builder")
+                if builder is None:
+                    raise RuntimeError(f"No builder defined for {model_name}")
+                
+                model = builder()
+                model.eval()
+                for p in model.parameters():
+                    p.requires_grad_(False)
+                
+                _cached_model["model"] = model
+                return model
+            
+            def _raw_infer(x):
+                model = _load_model()
+                xin = x
+                x = felgp_fs._as_nchw(x)
+                
+                # Move to same device
+                device = x.device
+                model = model.to(device)
+                
+                # Normalize for ImageNet (standard for torchvision models)
+                if x.shape[1] == 3:
+                    x = (x - felgp_fs._MEAN) / felgp_fs._STD
+                
+                # Forward pass
+                out = model(x)
+                
+                # Handle torchvision's dict output format
+                if isinstance(out, dict):
+                    out = out['out']  # torchvision models return {'out': logits, 'aux': ...}
+                
+                out = felgp_fs._as_nchw(out)
+                return felgp_fs._restore_like(out, xin)
 
         # Wrapper to handle channel slicing/remapping
         def fn(x):
@@ -416,7 +433,7 @@ def make_segmenter(model_name, num_classes: int, selected_classes: list[int] | N
             
         return fn
 
-    # 2. Handle Feature Extractors (ResNet, MobileNet backbones)
+    # 2. Handle Feature Extractors (backbones only)
     # These are NOT segmentation models, so baseline performance is expected to be near zero/random
     # unless we trained a head (which we don't do in baseline mode).
     feat_extractor_fn = make_feat_extractor(model_name)

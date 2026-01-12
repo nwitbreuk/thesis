@@ -383,6 +383,27 @@ def softmax_blend(a, b, temp: float = 1.0):
     out = a_al * weights[0] + b_al * weights[1]
     return out
 
+def normalize_to_selected_classes(x: torch.Tensor, selected_classes: list[int]) -> torch.Tensor:
+    """
+    Project arbitrary C-channel logits to len(selected_classes) channels.
+    Handles both 21-class VOC models and custom models.
+    """
+    xin = x
+    x = _as_nchw(x)
+    C = x.shape[1]
+    k = len(selected_classes)
+    
+    if C == k:
+        return x  # Already aligned
+    elif C == 21:  # VOC/COCO model
+        # Slice selected channels
+        valid_indices = [c for c in selected_classes if c < C]
+        if len(valid_indices) == k:
+            return x[:, valid_indices, :, :]
+    
+    # Fallback: project
+    return _project_channels_cached(x, k)
+
 # endregion
 
 # region ==== NN primitives ====

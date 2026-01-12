@@ -13,7 +13,7 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import numpy as np
 import time
 import multiprocessing
-from generic_seg_loader import AOIDualLightingDataset, GeneralSegDataset
+from generic_seg_loader import GeneralSegDataset
 import gp_restrict as gp_restrict
 import algo_iegp as evalGP
 import torch.nn.functional as F
@@ -23,7 +23,7 @@ import seggp_functions as felgp_fs
 import seg_types
 from typing import Any, Callable
 from visualize import visualize_predictions
-from data_handling import _seed_worker, ImagePreFilterWrapper, RemapWrapper, _set_global_seeds, build_class_remap, _enumerate_primitives, _enumerate_terminals, pad_collate, decode_binary_mask_from_g
+from data_handling import _seed_worker, ImagePreFilterWrapper, RemapWrapper, _set_global_seeds, build_class_remap, _enumerate_primitives, _enumerate_terminals, pad_collate
 import data_handling
 from miou_eval import eval_dataset_miou  # dataset-level mIoU (no penalties integrated)
 from algo_iegp import run_pretrained_baseline  # baseline eval without GP
@@ -34,24 +34,22 @@ logging.getLogger("torchvision").setLevel(logging.ERROR)
 
 
 # User-configurable options
-COLOR_MODE = "rgb"
-DATASET = "mitsumi"
-BASELINE_ONLY = True
-INCLUDE_TRANSFORMS = True
-RUN_MODE = "aoi_normal"
-# NEW: metric mode (auto detects from DATASET)
-METRIC_MODE = "auto"  # options: "auto", "aoi", "multiclass"
+COLOR_MODE = "rgb"  # "rgb" or "gray"
+DATASET = "voc" # "voc" , "mitsumi", "log_furex", "hikvision"
+BASELINE_ONLY = True # run only the pretrained NN and exit
+INCLUDE_TRANSFORMS = True  # set False to exclude transformation functions from the primitive set
+RUN_MODE = "fast"  # "fast", "middle", "normal" or "aoi_fast", "aoi_normal", "long"
 AUGMENTATION_SEED = 12  # Seed for data augmentation randomness
-randomSeeds = 12  # Change seed for different evolution paths
+randomSeeds = 42  # Change seed for different evolution paths
 Run_title_SUFFIX = ""  # Optional suffix for run name
 
-RUN_OUTDIR="/dataB1/niels_witbreuk/logs/myruns"
+RUN_OUTDIR="/dataB1/niels_witbreuk/logs/Heterogeneous"
 
 # Strategy: Use models with complementary strengths but not the best individual performers
 # This gives GP room to improve by combining them intelligently
-MODELS_TO_USE = ["aoi_1", "aoi_2", "aoi_3"]  # Custom AOI models trained for epoxy segmentation
+#MODELS_TO_USE = ["aoi_1", "aoi_2", "aoi_3"]  # Custom AOI models trained for epoxy segmentation
 #MODELS_TO_USE = ["model3", "model4", "model6", "model8", "model15"]  # Homogeneous
-#MODELS_TO_USE = ["deeplabv3_resnet50", "deeplabv3_resnet101", "fcn_resnet50", "lraspp_mobilenet_v3_large"]  # Heterogeneous
+MODELS_TO_USE = ["deeplabv3_resnet50", "deeplabv3_resnet101", "fcn_resnet50", "lraspp_mobilenet_v3_large"]  # Heterogeneous
 #MODELS_TO_USE = ["model1", "model2", "model3", "model4", "model6", "model8", "model9", "model11", "model12", "model15"] # Diverse models with test scores: 0.6748, 0.6851, 0.6793
 
 FITNESS_FUNCTION = "miou"  # Options: "dice" (binary), "miou" (multiclass IoU), "weighted_ce" (weighted cross-entropy)
@@ -64,7 +62,7 @@ MAX_COMPLEXITY_BONUS = 0.05       # Maximum bonus for tree complexity (reduced t
 
 # ✅ Data Augmentation Configuration
 # Use augmentation during training to give GP data diversity advantage
-USE_DATA_AUGMENTATION = False  # Set to False to disable augmentation
+USE_DATA_AUGMENTATION = True  # Set to False to disable augmentation
 AUGMENTATION_CONFIG = [
     {"name": "adjust_brightness", "args": [{"name": "delta"}], "enabled": True},
     {"name": "adjust_gamma",      "args": [{"name": "gamma"}], "enabled": True},
@@ -111,22 +109,14 @@ creator.Individual: Any  # type: ignore
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Infer number of classes from dataset selection
-if DATASET == ('voc', 'voc_test'):
+if DATASET == 'voc':
     inferred_classes = 21
 elif DATASET == 'coco':
     inferred_classes = 80
-elif DATASET in ('aoi', 'mitsumi', 'log_furex', 'hikvision'):
+elif DATASET == 'aoi':
     inferred_classes = 5
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
-
-# Decide which metric to use
-if METRIC_MODE == "aoi":
-    _USE_AOI_METRIC = True
-elif METRIC_MODE == "multiclass":
-    _USE_AOI_METRIC = False
-else:
-    _USE_AOI_METRIC = DATASET in ('aoi', 'mitsumi', 'log_furex', 'hikvision')
 
 # Resolve NUM_CLASSES based on selected classes and override
 if SELECTED_CLASSES and len(SELECTED_CLASSES) > 0:
@@ -143,10 +133,6 @@ if DATASET == 'voc':
     dataSetName = 'Pascal_VOC'
     image_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_train_val/VOC2012_train_val/JPEGImages"
     mask_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_train_val/VOC2012_train_val/SegmentationClass"
-if DATASET == 'voc_test':
-    dataSetName = 'Pascal_VOC'
-    image_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_test/VOC2012_test/JPEGImages"
-    mask_dir = "/dataB5/kieran_carrigg/VOC2012/VOC2012_test/VOC2012_test/SegmentationClass"
 elif DATASET == 'coco':
     dataSetName = 'COCO'
     image_dir = "/dataB1/niels_witbreuk/data/coco/images+"
@@ -166,21 +152,13 @@ elif DATASET == 'hikvision':
 else:
     raise ValueError(f"Unknown dataset option: {DATASET}")
 
-
-
-# Modify dataset loading to use AOI dataset for AOI modes
-if DATASET in ['mitsumi', 'log_furex', 'hikvision']:
-    dataset = AOIDualLightingDataset(image_dir, mask_dir, num_classes=5)
-    NUM_CLASSES = 5  # AOI uses 5 classes
-else:
-    # Use existing GeneralSegDataset for other datasets
-    dataset = GeneralSegDataset(
-        image_dir=image_dir,
-        mask_dir=mask_dir,
-        mode="png",
-        color_mode=COLOR_MODE,
-        num_classes=NUM_CLASSES
-    )
+dataset = GeneralSegDataset(
+    image_dir=image_dir,
+    mask_dir=mask_dir,
+    mode="png",
+    color_mode=COLOR_MODE,
+    num_classes=NUM_CLASSES
+)
 
 # --- NEW: detect original mask IDs and set background handling ---
 def _scan_unique_ids(ds, limit=64):
@@ -695,187 +673,103 @@ def _multiclass_preds(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch
     preds = probs.argmax(dim=1)  # (B,H,W)
     return preds, probs
 
-def _confmat_iou_from_logits(logits: torch.Tensor,
-                             masks: torch.Tensor,
-                             num_classes: int,
-                             ignore_index: int,
-                             exclude_background: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    VOC/COCO-style: logits->softmax->argmax, confusion-matrix IoU.
-    Returns per-class IoU and a boolean tensor 'present_in_gt' (classes seen in GT).
-    """
-    # Align and cast
-    if masks.dim() == 4 and masks.shape[1] > 1:
-        # if masks are one-hot by accident, reduce to argmax
-        masks = masks.argmax(dim=1)
-    elif masks.dim() == 4:
-        masks = masks.squeeze(1)
-    preds, _ = _multiclass_preds(logits, num_classes)  # (B,H,W)
-
-    # Flatten valid pixels
-    valid = masks != ignore_index
-    if exclude_background:
-        valid = valid & (masks != 0)
-
-    if valid.sum() == 0:
-        iou = torch.zeros(num_classes, device=logits.device)
-        present = torch.zeros(num_classes, dtype=torch.bool, device=logits.device)
-        return iou, present
-
-    gt = masks[valid].long()
-    pd = preds[valid].long()
-
-    # bincount confusion matrix
-    cm = torch.bincount(
-        gt * num_classes + pd, minlength=num_classes * num_classes
-    ).reshape(num_classes, num_classes).float()
-
-    # background exclusion (set row/col to zero so it contributes nothing)
-    if exclude_background and 0 < num_classes:
-        cm[0, :] = 0
-        cm[:, 0] = 0
-
-    tp = torch.diag(cm)
-    fp = cm.sum(0) - tp
-    fn = cm.sum(1) - tp
-    denom = tp + fp + fn
-    iou = torch.zeros_like(denom)
-    valid_cls = denom > 0
-    iou[valid_cls] = tp[valid_cls] / denom[valid_cls]
-
-    present_in_gt = cm.sum(1) > 0
-    if exclude_background and 0 < num_classes:
-        present_in_gt[0] = False
-    return iou, present_in_gt
-
 def evalTrain(toolbox, individual, hof):
     for h in (hof or []):
         if individual == h:
             return h.fitness.values
     try:
         func = toolbox.compile(expr=individual)
-        if NUM_CLASSES == 1:
-            # Binary Dice fitness
-            inter_total = 0.0
-            union_total = 0.0
-            max_batches = 50
+        
+        if FITNESS_FUNCTION == "weighted_ce" and NUM_CLASSES > 1:
+            # Weighted cross-entropy fitness
+            total_loss = 0.0
+            batch_count = 0
+            max_batches = 50  # Limit to prevent overfitting
             with torch.no_grad():
                 for batch_idx, (imgs, masks) in enumerate(train_loader):
                     if batch_idx >= max_batches:
                         break
-                    imgs = imgs.to(device)
-                    masks = masks.to(device)
-                    try:
-                        out = func(imgs)
-                        out = _align_to_mask(out, masks)
-                        preds, _ = _binarize_from_logits(out)
-                        inter = (preds * masks).sum().item()
-                        union = (preds + masks).sum().item()
-                        inter_total += inter
-                        union_total += union
-                    except Exception:
-                        continue
+                    imgs, masks = imgs.to(device), masks.to(device)
+                    logits = func(imgs)
+                    logits = _align_to_mask(logits, masks)
+                    logits = _ensure_k_channels(logits, NUM_CLASSES)
+                    
+                    logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, NUM_CLASSES)
+                    masks_flat = masks.view(-1).long()
+                    
+                    # ✅ Exclude background (class 0) AND ignore_index (255) from loss
+                    valid_mask = (masks_flat != IGNORE_INDEX) & (masks_flat != 0)
+                    if valid_mask.sum() > 0:
+                        loss = F.cross_entropy(
+                            logits_flat[valid_mask], 
+                            masks_flat[valid_mask], 
+                            weight=class_weights, 
+                            ignore_index=IGNORE_INDEX # type: ignore
+                        )
+                        if not (torch.isinf(loss) or torch.isnan(loss)):
+                            total_loss += loss.item()
+                            batch_count += 1
+            
+            avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
+            return (-avg_loss,)  # Negative because DEAP maximizes
+        
+        elif NUM_CLASSES == 1:
+            # Binary Dice fitness
+            inter_total = 0.0
+            union_total = 0.0
+            max_batches = 50  # Limit to prevent overfitting
+            with torch.no_grad():
+                for batch_idx, (imgs, masks) in enumerate(train_loader):
+                    if batch_idx >= max_batches:
+                        break
+                    imgs, masks = imgs.to(device), masks.to(device)
+                    out = func(imgs)
+                    out = _align_to_mask(out, masks)
+                    preds, probs = _binarize_from_logits(out)
+                    inter_total += float((preds * masks).sum().item())
+                    union_total += float(preds.sum().item() + masks.sum().item())
             dice = (2.0 * inter_total / (union_total + 1e-6)) if union_total > 0 else 0.0
             return (dice,)
         else:
-            if _USE_AOI_METRIC:
-                # ===== AOI metric (multi-label, sigmoid, present-classes only) =====
-                max_batches = 50
-                total_iou_intersection = torch.zeros(NUM_CLASSES).to(device)
-                total_iou_union = torch.zeros(NUM_CLASSES).to(device)
-                total_acc_valid = torch.zeros(NUM_CLASSES).to(device)
-                total_iou_valid = torch.zeros(NUM_CLASSES).to(device)
-
-                with torch.no_grad():
-                    for batch_idx, (imgs, masks) in enumerate(train_loader):
-                        if batch_idx >= max_batches:
-                            break
-                        imgs = imgs.to(device)
-                        masks = masks.to(device)  # (B,C,H,W) binary
-                        try:
-                            out = func(imgs)
-                            out = _align_to_mask(out, masks)  # (B,C?,H,W)
-                            out = _ensure_k_channels(out, NUM_CLASSES)
-                            probs = torch.sigmoid(out)
-                            preds = (probs > 0.5).float()
-
-                            preds_bool = preds.bool().float()
-                            masks_bool = masks.bool().float()
-                            intersection = (masks_bool * preds_bool).sum(dim=(0, 2, 3))
-                            union = ((masks_bool + preds_bool) > 0).sum(dim=(0, 2, 3)).float()
-                            acc_valid = masks_bool.sum(dim=(0, 2, 3)) > 0
-                            iou_valid = (masks_bool.sum(dim=(0, 2, 3)) + preds_bool.sum(dim=(0, 2, 3))) > 0
-
-                            iou_per_class = torch.zeros_like(intersection)
-                            valid_union = union > 0
-                            iou_per_class[valid_union] = intersection[valid_union] / union[valid_union]
-
-                            total_iou_intersection += iou_per_class * (iou_valid.float())
-                            total_iou_union += iou_valid.float()
-                            total_acc_valid += acc_valid.float()
-                            total_iou_valid += iou_valid.float()
-                        except Exception:
-                            continue
-
-                per_class_iou = torch.zeros(NUM_CLASSES).to(device)
-                for c in range(NUM_CLASSES):
-                    if total_iou_union[c] > 0:
-                        per_class_iou[c] = total_iou_intersection[c] / total_iou_union[c]
-                miou_present = per_class_iou[total_acc_valid > 0].mean().item() if (total_acc_valid > 0).sum() > 0 else 0.0
-            else:
-                # ===== VOC/COCO metric (multiclass, softmax+argmax, present-classes in GT) =====
-                max_batches = 50
-                iou_sum = torch.zeros(NUM_CLASSES, device=device)
-                present_sum = torch.zeros(NUM_CLASSES, dtype=torch.bool, device=device)
-
-                with torch.no_grad():
-                    for batch_idx, (imgs, masks) in enumerate(train_loader):
-                        if batch_idx >= max_batches:
-                            break
-                        imgs = imgs.to(device)
-                        masks = masks.to(device)  # (B,H,W) index with ignore
-                        try:
-                            out = func(imgs)
-                            out = _align_to_mask(out, masks.unsqueeze(1))  # align to (B,1,H,W)
-                            out = _ensure_k_channels(out, NUM_CLASSES)
-                            iou_vec, present_vec = _confmat_iou_from_logits(
-                                out, masks, NUM_CLASSES, IGNORE_INDEX, EXCLUDE_BACKGROUND # type: ignore
-                            )
-                            iou_sum += iou_vec
-                            present_sum |= present_vec
-                        except Exception:
-                            continue
-
-                valid_cls = present_sum
-                if valid_cls.any():
-                    miou_present = (iou_sum[valid_cls].mean()).item()
-                else:
-                    miou_present = 0.0
-
-            individual.base_miou = miou_present
+            # Standard mIoU fitness
+            # ⚠️ CRITICAL: Limit evaluation to subset of train data to prevent overfitting
+            # GP will be evaluated on random subset each generation, forcing generalization
+            _, miou = eval_dataset_miou(toolbox, individual, train_loader, NUM_CLASSES, device=device, ignore_index=IGNORE_INDEX, max_batches=50)
+            
+            # Store base mIoU for logging (without bonuses)
+            individual.base_miou = miou
+            
             # Apply bonuses if enabled
             diversity_bonus = 0.0
             complexity_bonus = 0.0
             
             if USE_DIVERSITY_BONUS:
+                # Reward using multiple different model primitives
                 unique_models = set()
                 for node in individual:
-                    if hasattr(node, 'name') and any(m in str(node.name) for m in MODELS_TO_USE):
-                        unique_models.add(node.name)
+                    if hasattr(node, 'name'):
+                        # Check if this node uses any of our registered models
+                        for model_name in MODELS_TO_USE:
+                            if model_name in str(node.name):
+                                unique_models.add(model_name)
                 diversity_bonus = len(unique_models) * DIVERSITY_BONUS_PER_MODEL
             
             if USE_COMPLEXITY_BONUS:
+                # Reward tree complexity (encourages combining primitives)
                 tree_size = len(individual)
-                complexity_bonus = min(MAX_COMPLEXITY_BONUS, (tree_size / 100.0) * MAX_COMPLEXITY_BONUS)
+                complexity_bonus = min(MAX_COMPLEXITY_BONUS, tree_size / 200.0)
             
+            # Store bonus info for debugging
             individual.diversity_bonus = diversity_bonus
             individual.complexity_bonus = complexity_bonus
             
-            total_fitness = miou_present + diversity_bonus + complexity_bonus
+            total_fitness = miou + diversity_bonus + complexity_bonus
             return (total_fitness,)
+    
     except Exception as e:
         print("Evaluation error (train):", e)
-        return (0.0,)
+        return (float('-inf'),) if FITNESS_FUNCTION == "weighted_ce" else (0.0,)
+
 
 toolbox.register("evaluate", evalTrain,toolbox)
 toolbox.register("select", tools.selTournament,tournsize=7)
@@ -942,54 +836,24 @@ def evalTest(toolbox, individual, test_loader):
             union_total = 0.0
             with torch.no_grad():
                 for imgs, masks in test_loader:
-                    imgs = imgs.to(device)
-                    masks = masks.to(device)
-                    out = func(imgs)
-                    out = _align_to_mask(out, masks)
-                    preds, _ = _binarize_from_logits(out)
-                    inter = (preds * masks).sum().item()
-                    union = (preds + masks).sum().item()
-                    inter_total += inter
-                    union_total += union
+                    imgs, masks = imgs.to(device), masks.to(device)
+                    out = func(imgs)                            # compute first
+                    out = _align_to_mask(out, masks)           # then align
+                    preds, probs = _binarize_from_logits(out)
+                    #if preds.dim() == 4 and masks.dim() == 4 and preds.shape[-2:] != masks.shape[-2:]:
+                    #    preds = F.interpolate(preds, size=masks.shape[-2:], mode='nearest')
+                    inter_total += float((preds * masks).sum().item())
+                    union_total += float(preds.sum().item() + masks.sum().item())
             dice = (2.0 * inter_total / (union_total + 1e-6)) if union_total > 0 else 0.0
             return dice
         else:
-            # ✅ AOI: mIoU on test set (only present classes)
-            func = toolbox.compile(expr=individual)
-            total_iou_intersection = torch.zeros(NUM_CLASSES).to(device)
-            total_acc_valid = torch.zeros(NUM_CLASSES).to(device)
-            total_iou_union = torch.zeros(NUM_CLASSES).to(device)
-
-            with torch.no_grad():
-                for imgs, masks in test_loader:
-                    imgs = imgs.to(device)
-                    masks = masks.to(device)
-                    out = func(imgs)
-                    out = _align_to_mask(out, masks)
-                    out = _ensure_k_channels(out, NUM_CLASSES)
-                    probs = torch.sigmoid(out)
-                    preds = (probs > 0.5).float()
-
-                    preds_bool = preds.bool().float()
-                    masks_bool = masks.bool().float()
-                    intersection = (masks_bool * preds_bool).sum(dim=(0, 2, 3))
-                    union = ((masks_bool + preds_bool) > 0).sum(dim=(0, 2, 3)).float()
-                    acc_valid = masks_bool.sum(dim=(0, 2, 3)) > 0
-
-                    iou_per_class = torch.zeros_like(intersection)
-                    valid_union = union > 0
-                    iou_per_class[valid_union] = intersection[valid_union] / union[valid_union]
-
-                    total_iou_intersection += iou_per_class * (valid_union.float())
-                    total_iou_union += valid_union.float()
-                    total_acc_valid += acc_valid.float()
-
-            per_class_iou = torch.zeros(NUM_CLASSES).to(device)
-            for c in range(NUM_CLASSES):
-                if total_iou_union[c] > 0:
-                    per_class_iou[c] = total_iou_intersection[c] / total_iou_union[c]
-            miou_test = per_class_iou[total_acc_valid > 0].mean().item() if (total_acc_valid > 0).sum() > 0 else 0.0
-            return miou_test
+            _, miou = eval_dataset_miou(
+                toolbox, individual, test_loader, NUM_CLASSES, 
+                device=device, ignore_index=IGNORE_INDEX,
+                exclude_background=EXCLUDE_BACKGROUND,
+                background_class=BACKGROUND_CLASS
+            )
+            return miou
     except Exception as e:
         print("Evaluation error (test):", e)
         return 0.0
